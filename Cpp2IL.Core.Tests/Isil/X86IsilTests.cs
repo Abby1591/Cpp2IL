@@ -117,10 +117,41 @@ public class X86IsilTests
             decoder.Decode(out var x86Instruction);
 
             var isil = new X86InstructionSet().GetIsilFromInstruction(x86Instruction);
-            
+
             Assert.That(isil.Count, Is.EqualTo(expected.Length), x86Instruction.ToString);
             for (var i = 0; i < expected.Length; i++)
                 Assert.That(isil[i].IsStructurallyEqualTo(expected[i]), Is.True, x86Instruction.ToString);
+        }
+    }
+
+    [Test]
+    public void X86IsilStackOperandTests()
+    {
+        Register Register(string name) => new(null, name);
+
+        // 32-bit code must treat esp-relative accesses as stack slots, exactly like x64 does for rsp.
+        var testCases = new (string Bytes, Instruction[] Expected)[]
+        {
+            ("8b 04 24", [new(0, OpCode.Move, Register("rax"), new StackOffset(0))]), // mov eax, [esp]
+            ("8b 44 24 08", [new(0, OpCode.Move, Register("rax"), new StackOffset(8))]), // mov eax, [esp+8]
+            ("8b 44 24 20", [new(0, OpCode.Move, Register("rax"), new StackOffset(0x20))]), // mov eax, [esp+0x20]
+            ("8b 44 24 fc", [new(0, OpCode.Move, Register("rax"), new StackOffset(-4))]), // mov eax, [esp-4]
+            ("8d 44 24 08", [new(0, OpCode.Move, Register("rax"), new AddressOf(new StackOffset(8)))]), // lea eax, [esp+8]
+            ("8b 45 08", [new(0, OpCode.Move, Register("rax"), new MemoryOperand(Register("rbp"), addend: 8))]), // mov eax, [ebp+8] — frame-pointer relative, resolved later by stack analysis
+            ("8b 45 fc", [new(0, OpCode.Move, Register("rax"), new MemoryOperand(Register("rbp"), addend: -4))]), // mov eax, [ebp-4] — negative displacements must sign-extend
+        };
+
+        foreach (var (bytes, expected) in testCases)
+        {
+            var instructionBytes = bytes.Split(' ').Select(byteValue => byte.Parse(byteValue, NumberStyles.HexNumber));
+            var decoder = Iced.Intel.Decoder.Create(32, new Iced.Intel.ByteArrayCodeReader(instructionBytes.ToArray()));
+            decoder.Decode(out var x86Instruction);
+
+            var isil = new X86InstructionSet().GetIsilFromInstruction(x86Instruction);
+
+            Assert.That(isil.Count, Is.EqualTo(expected.Length), x86Instruction.ToString);
+            for (var i = 0; i < expected.Length; i++)
+                Assert.That(isil[i].IsStructurallyEqualTo(expected[i]), Is.True, () => $"instruction: {x86Instruction}, got: {isil[i]}, expected: {expected[i]}");
         }
     }
 }

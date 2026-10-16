@@ -33,7 +33,7 @@ public static class DelegateInvokeRecovery
             if (delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke") is not { } invoke)
                 continue;
 
-            RewriteAsInvoke(instruction, delegateLocal, invoke);
+            RewriteAsInvoke(instruction, delegateLocal, invoke, method);
         }
     }
 
@@ -54,7 +54,7 @@ public static class DelegateInvokeRecovery
         return definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } ? loaded : null;
     }
 
-    private static void RewriteAsInvoke(Instruction call, LocalVariable delegateLocal, MethodAnalysisContext invoke)
+    private static void RewriteAsInvoke(Instruction call, LocalVariable delegateLocal, MethodAnalysisContext invoke, MethodAnalysisContext caller)
     {
         if (invoke.AppContext.InstructionSet.CallingConventionResolver is not { } callingConventions
             || !callingConventions.HasRawArgumentLayout(call, invoke.AppContext))
@@ -69,6 +69,6 @@ public static class DelegateInvokeRecovery
         // the receiver register holds invoke_impl_this rather than the delegate itself
         call.SetOperand(invoke.IsVoid ? 1 : 2, delegateLocal);
 
-        callingConventions.RemapRawArguments(call, invoke);
+        callingConventions.RemapRawArguments(call, invoke, caller);
     }
 }

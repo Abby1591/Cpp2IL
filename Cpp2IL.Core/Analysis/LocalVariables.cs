@@ -637,6 +637,10 @@ public static class LocalVariables
             // ... parameters
             var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
+            // Indirect or unmanaged calls may carry no argument operands at all.
+            if (instruction.Operands.Count <= thisParamIndex)
+                continue;
+
             // 'this' param
             if (!calledMethod.IsStatic
                 && instruction.Operands[thisParamIndex] is LocalVariable thisParam)

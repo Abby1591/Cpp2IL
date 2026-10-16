@@ -20,6 +20,11 @@ public class StackAnalyzer
     private Dictionary<Block, StackState> _outGoingState = [];
     private Dictionary<Instruction, StackState> _instructionState = [];
 
+    // Registers holding a captured copy of the stack pointer (e.g. frame pointers from `mov rbp, rsp`),
+    // mapped to the stack size at the point of capture. Used so epilogues like `mov rsp, rbp` can
+    // restore the tracked size instead of leaving it stale.
+    private readonly Dictionary<string, int> _capturedStackPointers = [];
+
     /// <summary>
     /// Max allowed count of blocks to visit (-1 for no limit).
     /// </summary>
@@ -34,7 +39,7 @@ public class StackAnalyzer
 
         analyzer._inComingState = new Dictionary<Block, StackState> { { graph.EntryBlock, new StackState() } };
 
-        analyzer.TraverseGraph(graph.EntryBlock);
+        analyzer.TraverseGraph(graph.EntryBlock, method.FullName);
 
         // The exit block has no outgoing state if it was never reached (e.g. every path loops or
         // throws). That's fine - just skip the end-of-method stack balance check in that case.
@@ -68,31 +73,31 @@ public class StackAnalyzer
         if (aliases.Count == 0)
             return;
 
-        // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
+        // Rewrite uses and invalidate aliases in a single forward pass. Running invalidation as a
+        // separate phase first would drop the alias as soon as the epilogue reassigns the frame
+        // pointer (e.g. `pop ebp`), before any of the body's [rbp+N] uses were ever rewritten.
         foreach (var instruction in graph.Instructions)
         {
+            if (_instructionState.TryGetValue(instruction, out var state))
+            {
+                for (var i = 0; i < instruction.Operands.Count; i++)
+                {
+                    if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frameBase } memory)
+                        continue;
+
+                    if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
+                        continue;
+
+                    instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
+                }
+            }
+
+            // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
             if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register { Name: "rsp" }] })
                 continue;
 
             if (instruction.Destination is Register written)
                 aliases.Remove(written.Name);
-        }
-
-        foreach (var instruction in graph.Instructions)
-        {
-            if (!_instructionState.TryGetValue(instruction, out var state))
-                continue;
-
-            for (var i = 0; i < instruction.Operands.Count; i++)
-            {
-                if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frameBase } memory)
-                    continue;
-
-                if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
-                    continue;
-
-                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
-            }
         }
     }
 
@@ -139,7 +144,7 @@ public class StackAnalyzer
     }
 
     // Traverse the graph and calculate the stack state for each block and instruction
-    private void TraverseGraph(Block initialBlock, int initialVisitedBlockCount = 0)
+    private void TraverseGraph(Block initialBlock, string methodName, int initialVisitedBlockCount = 0)
     {
         var blockLevelState = new Stack<(Block, int)>();
         blockLevelState.Push((initialBlock, initialVisitedBlockCount));
@@ -163,11 +168,35 @@ public class StackAnalyzer
                     currentState = currentState.Copy();
                     currentState.Size += offset;
                 }
+                else if (instruction is { OpCode: OpCode.Move, Operands: [Register destination, Register source] })
+                {
+                    if (source.Name == "rsp")
+                    {
+                        // `mov reg, rsp` captures the stack pointer (typically a frame pointer in the prologue).
+                        _capturedStackPointers[destination.Name] = currentState.Size;
+                    }
+                    else if (destination.Name == "rsp" && _capturedStackPointers.TryGetValue(source.Name, out var frameSize))
+                    {
+                        // `mov rsp, reg` restores a previously captured stack pointer (e.g. `mov esp, ebp`),
+                        // so the tracked size jumps back to whatever it was at the point of capture.
+                        currentState = currentState.Copy();
+                        currentState.Size = frameSize;
+                    }
+                    else
+                    {
+                        // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
+                        _capturedStackPointers.Remove(destination.Name);
+                    }
+                }
                 else if (block.Instructions[^1] == instruction && block.BlockType == BlockType.TailCall)
                 {
                     // Tail calls clear stack
                     currentState = currentState.Copy();
                     currentState.Size = 0;
+                }
+                else if (instruction.Destination is Register writtenRegister)
+                {
+                    _capturedStackPointers.Remove(writtenRegister.Name);
                 }
             }
 
@@ -180,7 +209,15 @@ public class StackAnalyzer
             visitedBlockCount++;
 
             if (MaxBlockVisitCount != -1 && visitedBlockCount > MaxBlockVisitCount)
-                throw new DecompilerException($"Stack state not settling! ({visitedBlockCount} blocks already visited)");
+                throw new DecompilerException(
+                    $"Stack state not settling! " +
+                    $"Method={methodName}, " +
+                    $"Visits={visitedBlockCount}, " +
+                    $"BlockID={block.ID}, " +
+                    $"BlockType={block.BlockType}, " +
+                    $"Incoming={incomingState.Size}, " +
+                    $"Outgoing={currentState.Size}, " +
+                    $"InstructionCount={block.Instructions.Count}");
 
             // Visit successors
             foreach (var successor in block.Successors)

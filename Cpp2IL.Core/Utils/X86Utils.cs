@@ -110,7 +110,7 @@ public static class X86Utils
 
         var span = rawBinary.Slice((int)rawAddr, (int)(lastPos - rawAddr + 1));
 
-        if (TryFindJumpTableStart(span, ptr, virtStartNextFunc, out var startIndex, out var jumpTableElements))
+        if (TryFindJumpTableStart(span, ptr, virtStartNextFunc, binary.is32Bit, out var startIndex, out var jumpTableElements))
         {
             // TODO: Figure out what to do with jumpTableElements, how do we handle returning it from this function?
             // we might need to return the address it was found at in TryFindJumpTableStart function too
@@ -125,29 +125,45 @@ public static class X86Utils
         return new BinarySlice(binary, (int)rawAddr, span.Length);
     }
 
-    private static bool TryFindJumpTableStart(ReadOnlySpan<byte> methodBytes, ulong methodPtr, ulong nextMethodPtr, out int startIndex, out List<ulong> jumpTableElements)
+    private static bool TryFindJumpTableStart(ReadOnlySpan<byte> methodBytes, ulong methodPtr, ulong nextMethodPtr, bool is32Bit, out int startIndex, out List<ulong> jumpTableElements)
     {
-        bool foundTable = false;
+        // A jump table is a contiguous run of 4-byte values that all point into the method.
+        // Requiring consecutive matches avoids false positives from individual address
+        // immediates embedded in the code (e.g. the table base in the jmp instruction itself).
+        const int MinTableLength = 3;
+
         startIndex = 0;
         jumpTableElements = [];
+        var consecutive = 0;
+        var runStart = 0;
+
         for (int i = (int)(methodPtr % 4); i < methodBytes.Length; i += 4)
         {
             var result = (ulong)methodBytes.ReadUInt(i);
-            var possibleJumpAddress = result + 0x180000000; // image base
+            // x64 PE jump tables store RVAs (relative to the image base); x86 PE jump tables
+            // store absolute virtual addresses. The x64 image base is hardcoded below.
+            var possibleJumpAddress = is32Bit ? result : result + 0x180000000;
             if (possibleJumpAddress > methodPtr && possibleJumpAddress < nextMethodPtr)
             {
-                // Sound the alarms, we've more than likely ran into a jump table  
-                if (!foundTable)
-                {
-                    startIndex = i;
-                    foundTable = true;
-                }
-
+                if (consecutive == 0)
+                    runStart = i;
+                consecutive++;
                 jumpTableElements.Add(result);
+
+                if (consecutive >= MinTableLength)
+                {
+                    startIndex = runStart;
+                    return true;
+                }
+            }
+            else
+            {
+                consecutive = 0;
+                jumpTableElements.Clear();
             }
         }
 
-        return foundTable;
+        return false;
     }
 
     public static InstructionList GetMethodBodyAtVirtAddressNew(ulong addr, bool peek, ApplicationAnalysisContext appContext, int peekLength = DefaultPeekLength) => GetMethodBodyAtVirtAddressNew(addr, peek, appContext, out _, peekLength);

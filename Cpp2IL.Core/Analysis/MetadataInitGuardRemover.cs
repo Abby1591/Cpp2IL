@@ -30,16 +30,27 @@ public static class MetadataInitGuardRemover
     public static void Run(MethodAnalysisContext method)
         => Run(method.ControlFlowGraph!, method.AppContext.Binary.is32Bit ? InitialisedFlagOffset32 : InitialisedFlagOffset64);
 
-    // Rewrite any metadata init calls we didn't remove into movs.
+    // Rewrite any metadata init calls we didn't remove into movs (or nops if the handle operand is absent).
     public static void RewriteUnguardedInits(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction.OpCode != OpCode.Call || instruction.Operands is not [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, var result, var handle, ..])
+            if (instruction.OpCode != OpCode.Call || instruction.Operands is not [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, var result, ..])
                 continue;
 
-            instruction.OpCode = OpCode.Move;
-            instruction.SetOperands(result, handle);
+            // With empty RawRegisters the call may only have [name, result]; the handle operand is missing,
+            // so there is nothing to pass through. The result is unused (it is just the metadata pointer
+            // the guard never needed), so a nop is safe.
+            if (instruction.Operands.Count >= 3)
+            {
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(result, instruction.Operands[2]);
+            }
+            else
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
         }
     }
     

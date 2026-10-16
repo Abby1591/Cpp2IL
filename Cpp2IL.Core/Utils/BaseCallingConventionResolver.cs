@@ -55,16 +55,71 @@ public abstract class BaseCallingConventionResolver
         return true;
     }
 
-    // TODO Fix handling of params on the stack here
-    public void RemapRawArguments(Instruction call, MethodAnalysisContext resolved)
+    public void RemapRawArguments(Instruction call, MethodAnalysisContext resolved, MethodAnalysisContext? caller = null)
     {
         var app = resolved.AppContext;
+        var argBase = ArgBase(call);
+
+        var (integerRegisters, floatRegisters) = RawRegisters(app);
+
+        // Stack-passing conventions (x86) have no argument registers to remap. When a call is
+        // resolved after initial lifter output (e.g. via MethodInfo), it may still carry the
+        // unmanaged operand layout (just target + return register). Rebuild the argument
+        // operands from the resolved signature so 'this' and parameters are present.
+        // The StackAnalyzer has already replaced StackOffset with LocalVariable("vN", Register("stack_N")),
+        // so we must reuse those existing locals rather than creating new Register operands.
+        if (integerRegisters.Length == 0 && floatRegisters.Length == 0 && HasRawArgumentLayout(call, app))
+        {
+            var stackArgs = ResolveForManaged(resolved);
+
+            // Index every LocalVariable in the caller method by its stack-slot register name
+            var localsBySlot = new Dictionary<string, LocalVariable>();
+            if (caller?.ControlFlowGraph != null)
+            {
+                foreach (var insn in caller.ControlFlowGraph.Instructions)
+                {
+                    foreach (var op in insn.Operands)
+                    {
+                        if (op is LocalVariable { Register.Name: var regName } lv && regName.StartsWith("stack") && !localsBySlot.ContainsKey(regName))
+                            localsBySlot[regName] = lv;
+                    }
+                }
+            }
+
+            var rebuilt = new List<IOperand>(argBase + stackArgs.Length);
+            for (var i = 0; i < argBase && i < call.Operands.Count; i++)
+                rebuilt.Add(call.Operands[i]);
+
+            // Reuse any LocalVariable the stack analysis already created for the slot; otherwise
+            // synthesize one here. A raw Register would reach IL emission un-lowered ("Unknown
+            // operand: stack[N]"), but LocalVariable operands are collected into method.Locals
+            // and loaded via LoadLocal. Locals created after LocalVariables.CreateAll pick up no
+            // type, which IlGenerator defaults to object.
+            var localsForCall = new Dictionary<string, LocalVariable>();
+            foreach (var arg in stackArgs)
+            {
+                if (arg is StackOffset slot)
+                {
+                    var name = slot.Offset < 0 ? $"stack_-{-slot.Offset:X}" : $"stack_{slot.Offset:X}";
+
+                    if (!localsBySlot.TryGetValue(name, out var existing) && !localsForCall.TryGetValue(name, out existing))
+                    {
+                        existing = new LocalVariable(name, new Register(null, name));
+                        localsForCall[name] = existing;
+                    }
+
+                    rebuilt.Add(existing);
+                }
+                else
+                    rebuilt.Add(arg);
+            }
+
+            call.SetOperands(rebuilt);
+            return;
+        }
 
         if (!HasRawArgumentLayout(call, app))
             return;
-
-        var (integerRegisters, floatRegisters) = RawRegisters(app);
-        var argBase = ArgBase(call);
 
         var slots = new List<(bool IsFloat, bool Emit)>();
         if (ReturnsViaHiddenBuffer(resolved) && HiddenBufferConsumesArgumentSlot)

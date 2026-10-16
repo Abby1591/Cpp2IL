@@ -25,7 +25,7 @@ public static class InternalCallGuardRemover
                 removedAny |= TryRemove(method, cfg, block, resolve);
         }
 
-        if (BindCallsToResolvedPointers(cfg))
+        if (BindCallsToResolvedPointers(cfg, method))
             removedAny = true;
 
         if (removedAny)
@@ -130,7 +130,7 @@ public static class InternalCallGuardRemover
         return true;
     }
 
-    private static bool BindCallsToResolvedPointers(ISILControlFlowGraph cfg)
+    private static bool BindCallsToResolvedPointers(ISILControlFlowGraph cfg, MethodAnalysisContext method)
     {
         var pointers = new Dictionary<LocalVariable, MethodAnalysisContext>();
 
@@ -181,7 +181,7 @@ public static class InternalCallGuardRemover
 
             instruction.OpCode = OpCode.Call; // same operand layout, and the target is known now
             instruction.SetOperand(0, resolved);
-            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
+            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved, method);
             changed = true;
         }
 

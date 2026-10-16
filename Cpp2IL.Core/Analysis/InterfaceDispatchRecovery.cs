@@ -216,7 +216,7 @@ public static class InterfaceDispatchRecovery
         }
 
         dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
-        callingConventions?.RemapRawArguments(dispatch, resolved);
+        callingConventions?.RemapRawArguments(dispatch, resolved, method);
 
         // name [phi+8] as the hidden MethodInfo param, like ResolveVirtualCalls. A tail call's target
         // register doubles as an argument slot, so a stale [phi] load can turn up as an argument too,

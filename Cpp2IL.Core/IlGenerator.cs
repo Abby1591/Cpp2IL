@@ -77,8 +77,16 @@ public static class IlGenerator
             if (operand is LocalVariable local2)
                 local = local2;
 
-            if (operand is MemoryOperand memory && memory.Base is LocalVariable local3)
-                local = local3;
+            if (operand is MemoryOperand memory)
+            {
+                if (memory.Base is LocalVariable local3)
+                    local = local3;
+
+                // RemoveUnused can't see locals that are only read through a memory operand's index
+                // (Sources carries the MemoryOperand, not its components), so re-add index locals too.
+                if (memory.Index is LocalVariable memoryIndex && !context.Locals.Contains(memoryIndex))
+                    context.Locals.Add(memoryIndex);
+            }
 
             var elementOperand = operand is AddressOf { Target: ArrayAccess elementAddress } ? elementAddress : operand;
 
@@ -225,7 +233,7 @@ public static class IlGenerator
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
-        => message.Length <= 250 ? message : message[..250] + "…";
+        => message.Length <= 250 ? message : message[..250] + "â€¦";
     
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
     {
@@ -310,7 +318,7 @@ public static class IlGenerator
                 }
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
-                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine, SourceType(instruction.Operands[1]));
                 break;
 
             case OpCode.NewArr:
@@ -358,9 +366,37 @@ public static class IlGenerator
             case OpCode.Box:
                 if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
                 {
-                    // il2cpp_value_box takes the value by address, but IL boxes it by value
-                    LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
+                    // il2cpp_value_box takes the value by address, but IL boxes it by value. An
+                    // AddressOf over a local addresses the value itself; any other operand is the
+                    // address (a frame-pointer arithmetic result or a literal), so after loading it
+                    // the referent has to be dereferenced onto the stack before boxing.
+                    if (boxedValue is AddressOf { Target: LocalVariable byRef })
+                    {
+                        LoadOperand(byRef, method, locals, writeLine, boxedType);
+                    }
+                    else
+                    {
+                        LoadOperand(boxedValue, method, locals, writeLine, boxedType);
+
+                        // A memory operand already dereferences through LoadOperand's byref/displacement
+                        // paths; a plain local or constant holds the address itself.
+                        if (boxedValue is not MemoryOperand)
+                            instructions.Add(new CilInstruction(CilOpCodes.Ldobj, boxedType.ToTypeSignature().ToTypeDefOrRef()));
+                    }
+
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldnull);
+
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.Unbox:
+                if (instruction.Operands is [_, TypeAnalysisContext unboxedType, var boxedObject])
+                {
+                    LoadOperand(boxedObject, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Unbox, unboxedType.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
                     instructions.Add(CilOpCodes.Ldnull);
@@ -692,18 +728,78 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
-                if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                if (memory.Index == null && memory.Scale == 0 && memory.Base is LocalVariable local2)
                 {
                     LoadLocal(local2, method, locals);
 
                     // A load through a managed pointer (byref) dereferences it to yield the referent.
-                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
-                        instructions.Add(referent.IsValueType
-                            ? new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef())
+                    if (memory.Addend == 0)
+                    {
+                        if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
+                            instructions.Add(referent.IsValueType
+                                ? new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef())
+                                : new CilInstruction(CilOpCodes.Ldind_Ref));
+                        break;
+                    }
+
+                    // [local + displacement]: a native pointer dereference at an offset (e.g. a field
+                    // access through an untyped object pointer). Compute the address, then load the
+                    // value - without this these loads fall through to a null placeholder below.
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)memory.Addend);
+                    instructions.Add(CilOpCodes.Add);
+                    instructions.Add(CilOpCodes.Conv_I);
+
+                    if (expectedType != null)
+                    {
+                        instructions.Add(expectedType.IsValueType
+                            ? new CilInstruction(CilOpCodes.Ldobj, expectedType.ToTypeSignature().ToTypeDefOrRef())
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
+                    }
+                    else
+                    {
+                        // Best-effort: the original operand size is lost by this point, and most raw
+                        // field loads on 32-bit targets are 4 bytes.
+                        instructions.Add(CilOpCodes.Ldind_I4);
+                    }
+
                     break;
                 }
+
+                // An empty operand is how the x86 lifter represents fs:[0] (the SEH chain slot: no
+                // base, no index, no displacement). The loaded frame pointer has no managed meaning;
+                // substitute the same null placeholder the diagnostic path used to emit, without
+                // the diagnostic noise.
+                if (memory.Base == null && memory.Index == null && memory.Addend == 0)
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                    break;
+                }
+
+                // General native addressing: [base + index*scale + addend], e.g. il2cpp globals
+                // ([addr]), array-object pointer arithmetic ([array + 0x10 + index*4]), or scaled
+                // index loads. After local lowering the components are LocalVariables (or null).
+                // Compute the effective address and dereference, matching the [local + displacement]
+                // path above; anything else still falls through to the diagnostic.
+                if ((memory.Base is null or LocalVariable) && (memory.Index is null or LocalVariable))
+                {
+                    EmitNativeAddress(memory, method, locals);
+                    instructions.Add(CilOpCodes.Conv_I);
+
+                    if (expectedType != null)
+                    {
+                        instructions.Add(expectedType.IsValueType
+                            ? new CilInstruction(CilOpCodes.Ldobj, expectedType.ToTypeSignature().ToTypeDefOrRef())
+                            : new CilInstruction(CilOpCodes.Ldind_Ref));
+                    }
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Ldind_I4);
+                    }
+
+                    break;
+                }
+
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
@@ -841,6 +937,17 @@ public static class IlGenerator
             _ => null
         };
 
+    // The managed type of a value already sitting on the stack, when an operand pins it down
+    // (typed locals and reconstructed field loads). Registers/immediates are untyped: their
+    // width is whatever the native instruction used, which the lift no longer records.
+    private static TypeAnalysisContext? SourceType(IOperand source) =>
+        source switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null
+        };
+
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -859,8 +966,49 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
     }
 
+    // Pushes the effective address of [base + index*scale + addend] for a native memory operand
+    // whose components survived local lowering (LocalVariable or null). Not converted to native
+    // int; the caller adds Conv_I before dereferencing.
+    private static void EmitNativeAddress(MemoryOperand memory, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var pushedSomething = false;
+
+        if (memory.Base is LocalVariable baseLocal)
+        {
+            LoadLocal(baseLocal, method, locals);
+            pushedSomething = true;
+        }
+
+        if (memory.Index is LocalVariable indexLocal)
+        {
+            LoadLocal(indexLocal, method, locals);
+
+            if (memory.Scale > 1)
+            {
+                instructions.Add(CilOpCodes.Ldc_I4, memory.Scale);
+                instructions.Add(CilOpCodes.Mul);
+            }
+
+            if (pushedSomething)
+                instructions.Add(CilOpCodes.Add);
+
+            pushedSomething = true;
+        }
+
+        if (memory.Addend != 0)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4, (int)memory.Addend);
+
+            if (pushedSomething)
+                instructions.Add(CilOpCodes.Add);
+        }
+    }
+
     private static void StoreToOperand(IOperand operand, MethodDefinition method,
-        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
+        TypeAnalysisContext? storedType = null)
     {
         var instructions = method.CilMethodBody!.Instructions;
 
@@ -904,11 +1052,33 @@ public static class IlGenerator
                 break;
 
             case MemoryOperand memory:
-                if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
-                    && memory.Base is LocalVariable local2)
+                if (memory.Index == null && memory.Scale == 0 && memory.Base is LocalVariable local2)
                 {
-                    // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    if (memory.Addend == 0)
+                    {
+                        // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
+                        instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                        break;
+                    }
+
+                    // [local + displacement] = value: store through a native pointer at an offset
+                    // (the store counterpart of the load path in LoadOperand). The value is already
+                    // on the stack; push the address and use stind instead of dropping the store.
+                    LoadLocal(local2, method, locals);
+                    instructions.Add(CilOpCodes.Ldc_I4, (int)memory.Addend);
+                    instructions.Add(CilOpCodes.Add);
+                    instructions.Add(CilOpCodes.Conv_I);
+
+                    if (storedType is { IsValueType: true } storedValueType)
+                    {
+                        // The value's exact type is known (e.g. a struct copied through a frame
+                        // slot before a box): store its true width. stind.i4 would truncate.
+                        instructions.Add(new CilInstruction(CilOpCodes.Stobj, storedValueType.ToTypeSignature().ToTypeDefOrRef()));
+                    }
+                    else
+                    {
+                        instructions.Add(CilOpCodes.Stind_I4); // best-effort size, same rationale as the load path
+                    }
                     break;
                 }
                 instructions.Add(CilOpCodes.Pop);

@@ -55,31 +55,37 @@ public class Il2CppRGCTXDefinition : ReadableClass
             return;
         }
 
-        type = IsLessThan(29) ? (Il2CppRGCTXDataType)reader.ReadInt32() : (Il2CppRGCTXDataType)reader.ReadInt64();
         if (IsLessThan(27.2f))
+        {
+            //Data is an inline index rather than a pointer: {int32 type; int32 data}
+            type = (Il2CppRGCTXDataType)reader.ReadInt32();
+            _defData = new Il2CppRGCTXDefinitionData();
+            _defData.Read(reader);
+            return;
+        }
+
+        //Pointers from 27.2 up to (but not including) 108: struct Il2CppRGCTXDefinition { Il2CppRGCTXDataType type; const void* data; }
+        //On 64-bit the enum is padded up to pointer alignment, so consume those pad bytes before the pointer.
+        type = (Il2CppRGCTXDataType)reader.ReadInt32();
+        if (!reader.is32Bit)
+            reader.Position += 4;
+
+        var va = reader.ReadNUint();
+        var bakPosition = reader.Position;
+
+        reader.Position = OwningContext.Binary.MapVirtualAddressToRaw(va);
+
+        if (type == Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED)
+        {
+            _constrainedData = new Il2CppRGCTXConstrainedData();
+            _constrainedData.Read(reader);
+        }
+        else
         {
             _defData = new Il2CppRGCTXDefinitionData();
             _defData.Read(reader);
         }
-        else
-        {
-            var va = reader.ReadNUint();
-            var bakPosition = reader.Position;
 
-            reader.Position = OwningContext.Binary.MapVirtualAddressToRaw(va);
-
-            if (type == Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED)
-            {
-                _constrainedData = new Il2CppRGCTXConstrainedData();
-                _constrainedData.Read(reader);
-            }
-            else
-            {
-                _defData = new Il2CppRGCTXDefinitionData();
-                _defData.Read(reader);
-            }
-
-            reader.Position = bakPosition;
-        }
+        reader.Position = bakPosition;
     }
 }

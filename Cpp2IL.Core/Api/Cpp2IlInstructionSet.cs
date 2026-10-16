@@ -62,6 +62,14 @@ public abstract class Cpp2IlInstructionSet
         => ([], []);
 
     /// <summary>
+    /// Whether the function at <paramref name="address"/> can return to its caller. Used to tell a
+    /// real exception raiser (which never returns) from an ordinary function that only may raise on
+    /// error. Returns false when this instruction set cannot determine it, so an unknown result
+    /// never blocks throw conversion.
+    /// </summary>
+    public virtual bool CalleeCanReturn(ApplicationAnalysisContext context, ulong address) => false;
+
+    /// <summary>
     /// For a simple thunk function, returns the jump target. Returns 0 if the function at <paramref name="thunkAddress"/>
     /// is not such a thunk, or if this instruction set does not implement thunk following.
     /// </summary>

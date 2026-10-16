@@ -229,33 +229,7 @@ public static class MetadataResolver
             {
                 // Not a managed method at all. It may be one of the runtime helpers built around an exception
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
-                if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
-                {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
-                    {
-                        callInstruction.OpCode = OpCode.Newobj;
-                        callInstruction.SetOperands(produced, thrown);
-                    }
-                    else
-                    {
-                        callInstruction.OpCode = OpCode.Throw;
-                        callInstruction.SetOperands(thrown);
-                    }
-
-                    continue;
-                }
-
-                // Otherwise it may be one of the raisers, which throw the exception they are given
-                var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
-
-                if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
-                {
-                    var raised = callInstruction.Operands[raisedIndex];
-
-                    callInstruction.OpCode = OpCode.Throw;
-                    callInstruction.SetOperands(raised);
-                }
-
+                TryConvertToThrowHelperOrRaiser(method, callInstruction, target);
                 continue;
             }
 
@@ -263,11 +237,71 @@ public static class MetadataResolver
             if (targetMethods is not [{ } singleTargetMethod])
                 continue;
 
+            // The native-method detector registers an injected stub for every unresolved call, but the
+            // call may still target an exception helper or raiser - the stub binding must not win over
+            // the CIL throw conversion.
+            if (singleTargetMethod is NativeMethodAnalysisContext && TryConvertToThrowHelperOrRaiser(method, callInstruction, target))
+                continue;
+
             callInstruction.SetOperand(0, singleTargetMethod);
-            singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod);
+            singleTargetMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(callInstruction, singleTargetMethod, method);
         }
 
         method.ControlFlowGraph.MergeCallBlocks();
+    }
+
+    /// <summary>
+    /// Turns a call to <paramref name="target"/> into CIL that throws: <c>newobj</c> when the target
+    /// is a runtime helper that builds an exception and the result is consumed (operand layout is
+    /// preserved), or <c>throw</c> when the target throws the exception it was given (taken from the
+    /// call's stack arguments, which only exist if <c>AttachKeyFunctionStackArguments</c> kept them).
+    /// Returns false - leaving the instruction untouched - when the target is neither, so callers can
+    /// fall through to normal binding (e.g. to an injected native stub).
+    /// </summary>
+    private static bool TryConvertToThrowHelperOrRaiser(MethodAnalysisContext method, Instruction callInstruction, ulong target)
+    {
+        if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
+        {
+            if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+            {
+                callInstruction.OpCode = OpCode.Newobj;
+                callInstruction.SetOperands(produced, thrown);
+            }
+            else
+            {
+                callInstruction.OpCode = OpCode.Throw;
+                callInstruction.SetOperands(thrown);
+            }
+
+            return true;
+        }
+
+        // Otherwise it may be one of the raisers, which throw the exception they are given
+        var raisedIndex = callInstruction.OpCode == OpCode.CallVoid ? 1 : 2;
+
+        if (callInstruction.Operands.Count > raisedIndex && ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+        {
+            // IsExceptionRaiser is a reachability check, so ordinary functions that may raise on
+            // error (klass lookups, array allocation) also match. A real raiser never hands a
+            // result back to its caller: if the produced value is read somewhere this is one of
+            // those, not a throw site, and must stay a normal call.
+            if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+                return false;
+
+            // Void-shaped sites have no result to check, so ask the callee instead: may-raise
+            // functions return normally, real raisers do not. Unknown (unscannable) counts as
+            // not returning, so this can only ever block a conversion, never starve one.
+            if (method.AppContext.InstructionSet.CalleeCanReturn(method.AppContext, target))
+                return false;
+
+            var raised = callInstruction.Operands[raisedIndex];
+
+            callInstruction.OpCode = OpCode.Throw;
+            callInstruction.SetOperands(raised);
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -302,12 +336,21 @@ public static class MetadataResolver
             {
                 var preferred = PreferredOf(candidates);
                 instruction.SetOperand(0, preferred);
-                preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred);
+                preferred.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, preferred, method);
                 changed = true;
                 continue;
             }
 
-            if (GetReceiver(instruction) is not { Type: { } receiverType } receiver)
+            if (GetReceiver(instruction, preferThis: method.Name == ".ctor") is not { } receiver)
+                continue;
+
+            // The receiver's own type is the best disambiguator, but a `this` receiver which hasn't
+            // been typed yet still tells us the declaring type - that is enough to resolve a call
+            // through a shared body (e.g. a ctor chaining to a folded base ctor, or a shared empty
+            // Dispose) by matching the candidate whose declaring type is on our base chain.
+            var receiverType = receiver.Type ?? (receiver.IsThis ? method.DeclaringType : null);
+
+            if (receiverType == null)
                 continue;
 
             // Prefer picking base ctor if we are a ctor
@@ -330,10 +373,16 @@ public static class MetadataResolver
             }
 
             if (match == null)
+                match = TryMatchStaticByFirstArgument(candidates, instruction);
+
+            if (match == null)
+                match = TryMatchInstanceByTypedArguments(candidates, instruction, receiverType);
+
+            if (match == null)
                 continue;
 
             instruction.SetOperand(0, match);
-            match.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, match);
+            match.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, match, method);
             changed = true;
         }
 
@@ -369,8 +418,27 @@ public static class MetadataResolver
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
     // A value type receiver is passed byref, so it arrives as an AddressOf over the local.
-    private static LocalVariable? GetReceiver(Instruction call)
+    // When preferThis is set (constructor chaining), the explicit 'this' local is authoritative:
+    // for an unresolved call the lifter attaches operands positionally without knowing the callee,
+    // so 'this' may not sit at the conventional index.
+    private static LocalVariable? GetReceiver(Instruction call, bool preferThis = false)
     {
+        if (preferThis)
+        {
+            foreach (var operand in call.Operands)
+            {
+                var thisLocal = operand switch
+                {
+                    LocalVariable { IsThis: true } local => local,
+                    AddressOf { Target: LocalVariable { IsThis: true } addressed } => addressed,
+                    _ => null
+                };
+
+                if (thisLocal != null)
+                    return thisLocal;
+            }
+        }
+
         var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
 
         return index < call.Operands.Count
@@ -381,6 +449,122 @@ public static class MetadataResolver
                 _ => null
             }
             : null;
+    }
+
+    // Static methods have no receiver, so a shared body such as the operator folds (op_Implicit,
+    // op_Equality, op_Inequality...) is disambiguated by the type of the first argument instead:
+    // e.g. IntPtr::op_Inequality(IntPtr, IntPtr) vs Type::op_Inequality(Type, Type) are told apart
+    // by whether the first argument is an IntPtr or a Type. Only a unique match is committed.
+    private static MethodAnalysisContext? TryMatchStaticByFirstArgument(List<MethodAnalysisContext> candidates, Instruction call)
+    {
+        // First argument sits after the target: operand 1 for CallVoid, operand 2 for Call
+        // (which also carries the return value).
+        var argIndex = call.OpCode == OpCode.CallVoid ? 1 : 2;
+
+        if (argIndex >= call.Operands.Count)
+            return null;
+
+        var argType = call.Operands[argIndex] switch
+        {
+            LocalVariable { Type: { } localType } => localType,
+            AddressOf { Target: LocalVariable { Type: { } addressedType } } => addressedType,
+            _ => null
+        };
+
+        if (argType == null)
+            return null;
+
+        MethodAnalysisContext? match = null;
+
+        foreach (var candidate in candidates)
+        {
+            if (!candidate.IsStatic || candidate.Parameters.Count == 0)
+                continue;
+
+            if (!IsSameType(candidate.Parameters[0].ParameterType, argType))
+                continue;
+
+            if (match != null)
+                return null; // ambiguous - two static candidates take the same first argument
+
+            match = candidate;
+        }
+
+        return match;
+    }
+
+    // Overloads on the same declaring type (e.g. Hazel.MessageWriter::Write(byte) vs Write(int)) share
+    // a body address and cannot be told apart by the receiver. Disambiguate them by the types of the
+    // arguments that are already known: a candidate is eliminated as soon as one of its parameters'
+    // types disagrees with the corresponding typed operand. Commits only when exactly one candidate
+    // survives and at least one argument was actually checked.
+    private static MethodAnalysisContext? TryMatchInstanceByTypedArguments(List<MethodAnalysisContext> candidates, Instruction call, TypeAnalysisContext receiverType)
+    {
+        // Arguments start after the target and, for an instance call, the receiver: operand 2 for
+        // CallVoid (target + this) and operand 3 for Call (target + return value + this).
+        var paramStart = call.OpCode == OpCode.Call ? 3 : 2;
+        var available = call.Operands.Count - paramStart;
+
+        if (available <= 0)
+            return null;
+
+        MethodAnalysisContext? match = null;
+        var anyChecked = false;
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.IsStatic || candidate.Parameters.Count == 0 || candidate.Parameters.Count > available)
+                continue;
+
+            if (!IsOnBaseChain(candidate.DeclaringType, receiverType))
+                continue;
+
+            var ok = true;
+            var checkedArgument = false;
+
+            for (var i = 0; i < candidate.Parameters.Count; i++)
+            {
+                if (OperandType(call.Operands[paramStart + i]) is not { } operandType)
+                    continue; // unknown argument type cannot discriminate
+
+                checkedArgument = true;
+
+                if (!IsSameType(candidate.Parameters[i].ParameterType, operandType))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (!ok || !checkedArgument)
+                continue;
+
+            anyChecked = true;
+
+            if (match != null)
+                return null; // ambiguous - two candidates agree with the typed arguments
+
+            match = candidate;
+        }
+
+        return anyChecked ? match : null;
+    }
+
+    private static TypeAnalysisContext? OperandType(IOperand operand) =>
+        operand switch
+        {
+            LocalVariable { Type: { } localType } => localType,
+            AddressOf { Target: LocalVariable { Type: { } addressedType } } => addressedType,
+            _ => null
+        };
+
+    private static bool IsOnBaseChain(TypeAnalysisContext? type, TypeAnalysisContext baseType)
+    {
+        for (var current = baseType; current != null; current = current.BaseType)
+            if (IsSameType(type, current))
+                return true;
+
+        return false;
     }
 
     // Concrete generic method contexts build their declaring type fresh rather than via the
@@ -435,7 +619,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, constructor);
-            constructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, constructor);
+            constructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, constructor, method);
             changed = true;
         }
 
@@ -525,7 +709,7 @@ public static class MetadataResolver
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
-                representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+                representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod, method);
                 changed = true;
                 continue;
             }
@@ -539,7 +723,7 @@ public static class MetadataResolver
                 continue;
 
             instruction.SetOperand(0, representedMethod);
-            representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+            representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod, method);
             changed = true;
         }
 
@@ -590,7 +774,7 @@ public static class MetadataResolver
 
             instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
             instruction.SetOperand(0, resolved);
-            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
+            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved, method);
 
             // the MethodInfo field is also the same method, name it, for cleanliness and so it can
             // serve as a hidden final parameter if needed
@@ -661,16 +845,16 @@ public static class MetadataResolver
 
     private static void HandleKeyFunction(ApplicationAnalysisContext appContext, Instruction instruction, ulong target, BaseKeyFunctionAddresses kFA)
     {
-        var method = "";
+        var keyFunctionName = "";
         if (target == kFA.il2cpp_codegen_initialize_method || target == kFA.il2cpp_codegen_initialize_runtime_metadata)
         {
             if (appContext.MetadataVersion < 27)
             {
-                method = nameof(kFA.il2cpp_codegen_initialize_method);
+                keyFunctionName = nameof(kFA.il2cpp_codegen_initialize_method);
             }
             else
             {
-                method = nameof(kFA.il2cpp_codegen_initialize_runtime_metadata);
+                keyFunctionName = nameof(kFA.il2cpp_codegen_initialize_runtime_metadata);
             }
         }
         else
@@ -679,13 +863,11 @@ public static class MetadataResolver
             var key = pairs.FirstOrDefault(pair => pair.Value == target).Key;
             if (key == null)
                 return;
-            method = key;
+            keyFunctionName = key;
         }
 
-        if (method != "")
-        {
-            instruction.SetOperand(0, new StringLiteral(method));
-        }
+        if (keyFunctionName != "")
+            instruction.SetOperand(0, new StringLiteral(keyFunctionName));
     }
 
     // Because of il2cpp fields (like cctor_finished_or_no_cctor) [local @ reg+offset] sometimes can't be resolved, but this works for now

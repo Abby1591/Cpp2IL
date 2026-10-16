@@ -123,6 +123,12 @@ public enum OpCode
     Box,
 
     /// <summary>
+    /// Unboxes the object at op 3 to the type described by op 2, and moves the resulting
+    /// managed pointer to the value into op 1.
+    /// </summary>
+    Unbox,
+
+    /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
     Throw

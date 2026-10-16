@@ -113,6 +113,7 @@ public class Instruction : IOperand
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.Unbox:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -151,10 +152,13 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box => [_operands[2]],
+            // A Newobj rewritten from il2cpp_codegen_object_new may lack the class operand
+            // when the unmanaged calling convention carried no argument operands.
+            OpCode.Newobj => _operands.Count > 1 ? [_operands[1]] : [],
+
+            OpCode.Box or OpCode.Unbox => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

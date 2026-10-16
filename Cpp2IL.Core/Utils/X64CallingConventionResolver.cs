@@ -52,6 +52,11 @@ public class X64CallingConventionResolver : BaseCallingConventionResolver
 
     protected override bool UsesShadowedArgumentSlots(ApplicationAnalysisContext app) => app.Binary is PE;
 
+    // Public forwarders so the 32/64-bit dispatcher can reuse this resolver's layout rules.
+    public (string[] Integer, string[] Float) RawRegistersFor(ApplicationAnalysisContext app) => RawRegisters(app);
+
+    public bool UsesShadowedArgumentSlotsFor(ApplicationAnalysisContext app) => UsesShadowedArgumentSlots(app);
+
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
     {
         // if (ctx.AppContext.Binary.is32Bit)

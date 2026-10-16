@@ -92,7 +92,11 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        // An uninflated definition is shared generic code, so its own type parameters stand in for
+        // the arguments when the entries name them (same as ResolveMethodEntry does for its owner).
+        var typeArguments = instance is GenericInstanceTypeAnalysisContext inflated
+            ? (IReadOnlyList<TypeAnalysisContext>)inflated.GenericArguments
+            : definition.GenericParameters;
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }
