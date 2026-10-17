@@ -45,4 +45,29 @@ public class GenericTypeArgsTests
             Assert.That(name, Does.EndWith("<" + expectedArgs + ">"), name);
         }
     }
+
+    // A generic instance must expose the open generic's base type (so IsDelegate/IsValueType/IsEnumType
+    // resolve) rather than the null produced by the metadata constructor previously.
+    [Test]
+    public void Generic_instance_exposes_base_type()
+    {
+        foreach (var gi in GenericInstances())
+        {
+            if (gi.GenericType.BaseType is null)
+                Assert.That(gi.BaseType, Is.Null, gi.FullName);
+            else
+                Assert.That(gi.BaseType, Is.Not.Null, gi.FullName);
+        }
+    }
+
+    // ...and must expose the open generic's methods (names preserved) so members can be found on it.
+    [Test]
+    public void Generic_instance_exposes_methods()
+    {
+        foreach (var gi in GenericInstances())
+        {
+            Assert.That(gi.Methods.Select(m => m.Name),
+                Is.EqualTo(gi.GenericType.Methods.Select(m => m.Name)), gi.FullName);
+        }
+    }
 }

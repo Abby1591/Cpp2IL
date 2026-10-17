@@ -60,6 +60,13 @@ public static class DelegateInvokeRecovery
             || !callingConventions.HasRawArgumentLayout(call, invoke.AppContext))
             return;
 
+        // The raw call must carry an actual receiver operand to substitute. The layout is
+        // [target, return-reg, receiver, ...]; a stack-passing call (e.g. 32-bit) is only
+        // [target, return-reg], so there is nothing to rewrite - leave it untouched rather than
+        // indexing past the operand list.
+        if (call.Operands.Count < 3)
+            return;
+
         if (invoke.IsVoid)
             call.RemoveOperandAt(1);
 

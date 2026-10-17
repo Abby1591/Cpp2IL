@@ -34,7 +34,56 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
         set => GenericType.OverrideNamespace = value;
     }
 
-    public sealed override TypeAnalysisContext? DefaultBaseType { get; }
+    // The base type of a generic instance is the base type of the open generic definition, with the
+    // instance's generic arguments substituted where the base is itself generic (e.g. Action<T>'s
+    // MulticastDelegate, or Derived<T>'s Base<T> -> Base<actual>). Previously this was only populated
+    // by the (TypeAnalysisContext, args) constructor, leaving instances built from metadata with a null
+    // base type - which in turn made IsDelegate/IsValueType/IsEnumType resolve incorrectly.
+    public sealed override TypeAnalysisContext? DefaultBaseType => InstantiateBaseType();
+
+    private TypeAnalysisContext? InstantiateBaseType()
+    {
+        var baseType = GenericType.BaseType;
+
+        if (baseType == null || !baseType.HasAnyGenericParameters())
+            return baseType;
+
+        try
+        {
+            return GenericInstantiation.Instantiate(baseType, GenericArguments, []);
+        }
+        catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException)
+        {
+            // Nested/partial generics can reference declaring-type parameters we don't hold here - fall back.
+            return baseType;
+        }
+    }
+
+    private List<MethodAnalysisContext>? _instantiatedMethods;
+
+    // Expose the open generic's methods with this instance's type arguments substituted, so that callers
+    // (delegate recovery, type resolution, display) see e.g. Action<string>.Invoke(string) rather than nothing.
+    public override List<MethodAnalysisContext> Methods => _instantiatedMethods ??= BuildInstantiatedMethods();
+
+    private List<MethodAnalysisContext> BuildInstantiatedMethods()
+    {
+        var methods = new List<MethodAnalysisContext>(GenericType.Methods.Count);
+
+        foreach (var method in GenericType.Methods)
+        {
+            try
+            {
+                methods.Add(new ConcreteGenericMethodAnalysisContext(method, GenericArguments, []));
+            }
+            catch (ArgumentException)
+            {
+                // Arity mismatch (e.g. a nested type whose declaring-type arguments differ) - keep the base method.
+                methods.Add(method);
+            }
+        }
+
+        return methods;
+    }
 
     public sealed override Il2CppTypeEnum Type => Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST;
 
@@ -69,7 +118,6 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
     {
         GenericType = genericType;
         GenericArguments.AddRange(genericArguments);
-        DefaultBaseType = genericType.BaseType;
 
         SetDeclaringType();
     }

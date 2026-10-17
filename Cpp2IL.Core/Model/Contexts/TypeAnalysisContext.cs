@@ -29,7 +29,11 @@ public class TypeAnalysisContext : HasGenericParameters, ITypeInfoProvider, ISIL
     /// <summary>
     /// The analysis contexts for methods contained within this type.
     /// </summary>
-    public readonly List<MethodAnalysisContext> Methods;
+    /// <remarks>
+    /// Virtual so that <see cref="GenericInstanceTypeAnalysisContext"/> can expose the base type's
+    /// methods with its generic arguments substituted.
+    /// </remarks>
+    public virtual List<MethodAnalysisContext> Methods { get; }
 
     /// <summary>
     /// The analysis contexts for properties contained within this type.
