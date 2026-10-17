@@ -75,4 +75,19 @@ public class X86StackAdjustmentTests
 
         Assert.That(X86InstructionSet.GetStackAccessSize(instruction), Is.EqualTo(expectedSize));
     }
+
+    // Regression tests for IL2CPP x86-32 tail-call thunks (e.g. Among Us). A thunk such as
+    // CrossplayModeCycle::OnEnable (16 bytes @ 0x104C49F0) ends with `jmp 0x104C4A00`, which is exactly
+    // the first byte past the method - an external tail-branch onto the following method. The end used to
+    // be computed from the jumping instruction's own address, overshooting by the branch offset, so the
+    // branch was treated as an internal jump and the method emitted `Invalid "Jump target not found"`.
+    [TestCase(0x104C49F0UL, 16, 0x104C4A00UL, true)] // jmp to the byte just past the method end -> external (the regression)
+    [TestCase(0x104C49F0UL, 16, 0x104C49FBUL, false)] // jmp to the last instruction -> internal
+    [TestCase(0x104C49F0UL, 16, 0x104C49F0UL, false)] // jmp back to the method start (loop) -> internal
+    [TestCase(0x104C49F0UL, 16, 0x104C4A10UL, true)] // jmp well past the method -> external
+    [TestCase(0x104C49F0UL, 16, 0x104C49EFUL, true)] // jmp one byte before the method -> external
+    public void BranchTargetJustPastTheMethodEndIsExternal(ulong methodStart, int rawLength, ulong target, bool expectedExternal)
+    {
+        Assert.That(X86InstructionSet.IsBranchTargetOutsideMethod(methodStart, rawLength, target), Is.EqualTo(expectedExternal));
+    }
 }

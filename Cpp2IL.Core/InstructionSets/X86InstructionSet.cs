@@ -390,6 +390,17 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     }
 
     /// <summary>
+    /// The method occupies the half-open byte range [methodStart, methodStart + rawLength); the end is
+    /// exclusive, i.e. the first byte past the method. An unconditional branch landing exactly on that
+    /// end targets the following method - an external tail-branch (a tail call), not an internal jump.
+    /// Deriving the end from the jumping instruction's own address (as was done previously) overshoots by
+    /// the branch offset, classifying such thunks as internal jumps and leaving them as an unrecoverable
+    /// Invalid instead of a tail call.
+    /// </summary>
+    internal static bool IsBranchTargetOutsideMethod(ulong methodStart, int rawLength, ulong target) =>
+        target < methodStart || target >= methodStart + (ulong)rawLength;
+
+    /// <summary>
     /// MSVC x86 compiles instance methods as thiscall, so an indirect call (function pointer /
     /// vtable entry) can pop its own stack arguments. Direct calls scan the callee with
     /// <see cref="TryScanRetArgumentCleanup"/>, but indirect targets are usually runtime-resolved
@@ -1555,10 +1566,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     var jumpTarget = instruction.NearBranchTarget;
 
-                    var methodEnd = instruction.IP + (ulong)context.RawBytes.Length;
-                    var methodStart = context.UnderlyingPointer;
-
-                    if (jumpTarget < methodStart || jumpTarget > methodEnd)
+                    if (IsBranchTargetOutsideMethod(context.UnderlyingPointer, context.RawBytes.Length, jumpTarget))
                     {
                         callNoReturn = true;
                         goto case Mnemonic.Call;
