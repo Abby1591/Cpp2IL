@@ -328,7 +328,19 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             Func<ulong, bool> needsStackArguments = address =>
                 keyFunctionAddresses.IsKeyFunctionAddress(address)
                 || ThrowHelperRecovery.IsExceptionRaiser(context.AppContext, address);
-            AttachKeyFunctionStackArguments(instructions, addresses, needsStackArguments);
+
+            // Some key functions have a fixed, known argument count. When the length is pushed in a
+            // predecessor block (branches that each push a different length then jump to the shared
+            // class-push), the contiguous-push scan undercounts and the argument is lost. Fall back to
+            // the known arity so the operand is still present for recovery.
+            Func<ulong, int> knownArgumentCount = address =>
+                address != 0 && (address == keyFunctionAddresses.il2cpp_array_new_specific
+                    || address == keyFunctionAddresses.il2cpp_vm_array_new_specific
+                    || address == keyFunctionAddresses.SzArrayNew)
+                    ? 2 // (klass, length)
+                    : 0;
+
+            AttachKeyFunctionStackArguments(instructions, addresses, needsStackArguments, knownArgumentCount);
         }
 
         // fix branches
@@ -564,7 +576,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     /// stay live and the resolved arguments reach <c>KeyFunctionRecovery</c> / <c>ArrayRecovery</c>.
     /// A call with no visible push run keeps the bare layout.
     /// </summary>
-    internal static void AttachKeyFunctionStackArguments(List<ISIL.Instruction> instructions, List<ulong> addresses, Func<ulong, bool> isKeyFunctionTarget)
+    internal static void AttachKeyFunctionStackArguments(List<ISIL.Instruction> instructions, List<ulong> addresses, Func<ulong, bool> isKeyFunctionTarget, Func<ulong, int>? knownArgumentCount = null)
     {
         // Jump operands are still raw target addresses here (fix-branches runs after this pass).
         var jumpTargets = new HashSet<ulong>();
@@ -589,6 +601,12 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
             var pushedBytes = CountPushedArgumentBytes(instructions, addresses, jumpTargets, i);
             var argumentCount = pushedBytes / 4; // one stack slot per pointer on x86
+
+            // A known arity can exceed the scanned push run when an argument was pushed in a
+            // predecessor block (see the caller). Only extend an existing run, never materialise
+            // arguments for a call that shows no pushes at all.
+            if (argumentCount > 0 && knownArgumentCount?.Invoke(dest.UnsignedValue) is { } known && known > argumentCount)
+                argumentCount = known;
 
             for (var slot = 0; slot < argumentCount; slot++)
                 call.AddOperands([new ISIL.StackOffset(slot * 4)]);

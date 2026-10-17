@@ -207,4 +207,39 @@ public class KeyFunctionStackArgumentAttachmentTests
         Assert.That(call.Operands, Has.Count.EqualTo(3), "only the jump-target block's push is counted");
         Assert.That(((StackOffset)call.Operands[2]).Offset, Is.EqualTo(0));
     }
+
+    [Test]
+    public void KnownArgumentCountExtendsAnUndercountedRun()
+    {
+        // il2cpp_array_new_specific(klass, length): branches push different lengths then jump to the
+        // shared class push, so the contiguous scan only sees the class (slot 0). The known arity (2)
+        // restores the missing length slot so array recovery can see it.
+        var instructions = new List<Instruction>();
+        Push(instructions, 0, Reg("rcx")); // the class push in this block
+        Add(instructions, 2, OpCode.Call, new Immediate(KeyFunction), Reg("rax"));
+        Add(instructions, 3, OpCode.Return);
+        var addresses = new List<ulong> { 0, 0, 1, 2 };
+
+        X86InstructionSet.AttachKeyFunctionStackArguments(instructions, addresses, IsKey, _ => 2);
+
+        var call = instructions[2];
+        Assert.That(call.Operands, Has.Count.EqualTo(4), "target, return register and two stack slots");
+        Assert.That(((StackOffset)call.Operands[2]).Offset, Is.EqualTo(0), "the scanned class push is argument 0");
+        Assert.That(((StackOffset)call.Operands[3]).Offset, Is.EqualTo(4), "the known arity restores the missing length");
+    }
+
+    [Test]
+    public void KnownArgumentCountDoesNotMaterialiseArgumentsWithoutAPushRun()
+    {
+        // A key function with a known arity but no visible push run was not called with stack
+        // arguments here; the fallback must never fabricate operands from nothing.
+        var instructions = new List<Instruction>();
+        Add(instructions, 0, OpCode.Call, new Immediate(KeyFunction), Reg("rax"));
+        Add(instructions, 1, OpCode.Return);
+        var addresses = new List<ulong> { 0, 1 };
+
+        X86InstructionSet.AttachKeyFunctionStackArguments(instructions, addresses, IsKey, _ => 2);
+
+        Assert.That(instructions[0].Operands, Has.Count.EqualTo(2), "no pushes means the call stays bare");
+    }
 }
