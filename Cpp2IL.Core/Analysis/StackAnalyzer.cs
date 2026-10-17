@@ -62,43 +62,127 @@ public class StackAnalyzer
     private void ResolveFrameAliases(ISILControlFlowGraph graph)
     {
         var aliases = new Dictionary<string, int>();
+        var captures = new HashSet<Instruction>();
 
         foreach (var instruction in graph.EntryBlock.Successors.SelectMany(b => b.Instructions))
         {
             if (instruction is { OpCode: OpCode.Move, Operands: [Register destination, Register { Name: "rsp" }] }
                 && _instructionState.TryGetValue(instruction, out var atCopy))
+            {
                 aliases[destination.Name] = atCopy.Size;
+                captures.Add(instruction);
+            }
         }
 
         if (aliases.Count == 0)
             return;
 
-        // Rewrite uses and invalidate aliases in a single forward pass. Running invalidation as a
-        // separate phase first would drop the alias as soon as the epilogue reassigns the frame
-        // pointer (e.g. `pop ebp`), before any of the body's [rbp+N] uses were ever rewritten.
+        // A captured frame pointer stays trustworthy until a path clobbers the register. The
+        // instruction list is *not* in execution order - an epilogue's `pop frame` can be listed
+        // before the body it runs after - so validity has to follow the control flow rather than
+        // list position, otherwise a body `[frame+N]` use is dropped merely because an unrelated
+        // epilogue appears earlier in the list.
+        var liveAliases = ComputeLiveAliases(graph, aliases, captures);
+
         foreach (var instruction in graph.Instructions)
         {
-            if (_instructionState.TryGetValue(instruction, out var state))
-            {
-                for (var i = 0; i < instruction.Operands.Count; i++)
-                {
-                    if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frameBase } memory)
-                        continue;
-
-                    if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
-                        continue;
-
-                    instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
-                }
-            }
-
-            // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
-            if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register { Name: "rsp" }] })
+            if (!_instructionState.TryGetValue(instruction, out var state))
                 continue;
 
-            if (instruction.Destination is Register written)
-                aliases.Remove(written.Name);
+            var live = liveAliases.TryGetValue(instruction, out var set) ? set : (ISet<string>?)null;
+
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frameBase } memory)
+                    continue;
+
+                if (live == null || !live.Contains(frameBase.Name))
+                    continue;
+
+                instruction.SetOperand(i, new StackOffset((int)(aliases[frameBase.Name] + memory.Addend - state.Size)));
+            }
         }
+    }
+
+    // Forward must-analysis: a captured frame register still holds its prologue stack pointer at an
+    // instruction only if no path reaching that instruction reassigned it. An alias written anywhere
+    // in a block is treated as clobbered for the whole block's exit (conservative but safe).
+    private static Dictionary<Instruction, ISet<string>> ComputeLiveAliases(ISILControlFlowGraph graph, Dictionary<string, int> aliases, HashSet<Instruction> captures)
+    {
+        var all = (ISet<string>)new HashSet<string>(aliases.Keys);
+        var outState = new Dictionary<Block, ISet<string>>();
+
+        bool changed;
+        do
+        {
+            changed = false;
+
+            foreach (var block in graph.Blocks)
+            {
+                var incoming = InState(block, graph, outState, all);
+                var current = incoming;
+
+                foreach (var instruction in block.Instructions)
+                {
+                    if (!captures.Contains(instruction) && instruction.Destination is Register written && current.Contains(written.Name))
+                    {
+                        var next = new HashSet<string>(current);
+                        next.Remove(written.Name);
+                        current = next;
+                    }
+                }
+
+                if (!outState.TryGetValue(block, out var existing) || !existing.SetEquals(current))
+                {
+                    outState[block] = current;
+                    changed = true;
+                }
+            }
+        } while (changed);
+
+        var result = new Dictionary<Instruction, ISet<string>>();
+
+        foreach (var block in graph.Blocks)
+        {
+            var current = InState(block, graph, outState, all);
+
+            foreach (var instruction in block.Instructions)
+            {
+                result[instruction] = current;
+
+                if (!captures.Contains(instruction) && instruction.Destination is Register written && current.Contains(written.Name))
+                {
+                    var next = new HashSet<string>(current);
+                    next.Remove(written.Name);
+                    current = next;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static ISet<string> InState(Block block, ISILControlFlowGraph graph, Dictionary<Block, ISet<string>> outState, ISet<string> all)
+    {
+        // The prologue capture runs at the very start of the body, so the entry block already has
+        // every alias available; a register is live at a normal block only if it is live on every
+        // incoming edge.
+        if (block == graph.EntryBlock)
+            return all;
+
+        HashSet<string>? incoming = null;
+
+        foreach (var predecessor in block.Predecessors)
+        {
+            var outOfPred = outState.TryGetValue(predecessor, out var value) ? value : all;
+
+            if (incoming == null)
+                incoming = new HashSet<string>(outOfPred);
+            else
+                incoming.IntersectWith(outOfPred);
+        }
+
+        return incoming ?? (ISet<string>)new HashSet<string>();
     }
 
     private void CorrectOffsets(ISILControlFlowGraph graph)

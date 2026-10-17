@@ -164,4 +164,35 @@ public class StackAnalyzerTests
         Assert.That(((Register)load.Operands[1]).Name, Is.EqualTo("stack_4"),
             "slot = frame capture (-4) + 8 = +4 above the entry stack");
     }
+
+    [Test]
+    public void BodyFrameLoadSurvivesASiblingEpilogueListedFirst()
+    {
+        // The ISIL instruction list is BFS order, not execution order. An early-exit epilogue that
+        // reassigns the frame pointer can be a sibling block listed before the body, so a flat
+        // forward pass drops the alias before ever reaching the body's [ebp+N] use - even though
+        // that use runs before the epilogue. Alias validity must follow control flow.
+        var rbp = new Register(null, "rbp");
+        var rsp = new Register(null, "rsp");
+        var rax = new Register(null, "rax");
+        var zf = new Register(null, "ZF");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.ShiftStack, Imm(-4)), // A: push ebp
+            new(1, OpCode.Move, rbp, rsp), // A: mov ebp, esp
+            new(2, OpCode.ConditionalJump, Imm(6), zf), // A: branch to the body, else fall into the epilogue
+            new(3, OpCode.Move, rsp, rbp), // B: early-exit epilogue
+            new(4, OpCode.Move, rbp, new Register(null, "stack_0")), // B: pop ebp (reassigns the frame)
+            new(5, OpCode.Return), // B
+            new(6, OpCode.Move, rax, new MemoryOperand(rbp, addend: 8)), // C: mov eax, [ebp+8] (this)
+            new(7, OpCode.Return), // C
+        };
+
+        Assert.DoesNotThrow(() => RunStackAnalyzer(instructions));
+
+        var load = instructions[6];
+        Assert.That(load.Operands[1], Is.InstanceOf<Register>(),
+            "[ebp+8] must be folded even though a sibling epilogue clobbering rbp is listed first");
+        Assert.That(((Register)load.Operands[1]).Name, Is.EqualTo("stack_4"));
+    }
 }
