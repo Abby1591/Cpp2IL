@@ -227,6 +227,33 @@ public class MetadataResolverOverloadResolutionTests
     }
 
     [Test]
+    public void ArrayParametersWithDistinctInstancesAreFoldable()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_5681;
+
+        // An array is a reference, so it occupies one pointer slot whatever its element type. The element
+        // types are resolved per-parameter, so the two `byte[]`s here are different instances; a fold must
+        // not be lost to that identity difference.
+        var doArray = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Do",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [new SzArrayTypeAnalysisContext(appContext.SystemTypes.SystemByteType)]);
+        var actArray = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Act",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [new SzArrayTypeAnalysisContext(appContext.SystemTypes.SystemByteType)]);
+        appContext.MethodsByAddress[shared] = [doArray, actArray];
+
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)));
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)]);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(doArray), "arrays with the same element type are interchangeable at the call");
+    }
+
+    [Test]
     public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

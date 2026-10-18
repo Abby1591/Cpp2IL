@@ -491,6 +491,15 @@ public static class MetadataResolver
         if (ReferenceEquals(a, b))
             return true;
 
+        // An array is a reference, so it occupies a single pointer slot whatever its element type. The element
+        // types are resolved per-parameter, so two `byte[]`s are different instances that a reference check
+        // would reject; compare arrays structurally instead, matching the width rule for primitives below.
+        if (a is SzArrayTypeAnalysisContext szA && b is SzArrayTypeAnalysisContext szB)
+            return AbiEquivalent(szA.ElementType, szB.ElementType, types);
+
+        if (a is ArrayTypeAnalysisContext arrA && b is ArrayTypeAnalysisContext arrB)
+            return arrA.Rank == arrB.Rank && AbiEquivalent(arrA.ElementType, arrB.ElementType, types);
+
         var width = IntegerWidth(a, types);
         return width != 0 && width == IntegerWidth(b, types);
     }
