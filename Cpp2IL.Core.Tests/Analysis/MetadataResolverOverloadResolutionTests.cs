@@ -39,6 +39,37 @@ public class MetadataResolverOverloadResolutionTests
         return method;
     }
 
+    [Test]
+    public void MixedShapeIcfFoldFoldsTheCandidatesThatFitTheCall()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_567F;
+
+        // ICF folds a run of parameterless Dispose()s together with an unrelated one-argument method.
+        var disposeA = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Dispose",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public, []);
+        var disposeB = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Dispose",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public, []);
+        var unrelated = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Touch",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemObjectType]);
+        appContext.MethodsByAddress[shared] = [disposeA, disposeB, unrelated];
+
+        // The call carries the receiver plus one extra operand the lifter attached, so only the parameterless
+        // Disposes fit; they share a shape even though the unrelated method does not, so the call can resolve.
+        var receiver = new LocalVariable("self", new Register(null, "esi"));
+        var extra = new LocalVariable("extra", new Register(null, "edi"));
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)), receiver, extra);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], receiver, extra);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(disposeA), "the parameterless fold resolves the call");
+    }
+
     private static (MethodAnalysisContext Byte, MethodAnalysisContext Int) RegisterWriteOverloads(ulong shared)
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

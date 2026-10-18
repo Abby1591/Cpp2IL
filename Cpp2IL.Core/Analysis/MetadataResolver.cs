@@ -407,6 +407,12 @@ public static class MetadataResolver
             if (match == null && ShareCallShape(candidates))
                 match = PreferredOf(candidates);
 
+            // ICF can also fold methods of *different* shapes onto one body (e.g. thousands of empty
+            // Dispose() alongside an unrelated one-argument method). A candidate that cannot take the
+            // arguments the call actually carries cannot be the callee, so fold the ones whose arity fits.
+            if (match == null)
+                match = FoldByCallArity(candidates, instruction);
+
             if (match == null)
                 continue;
 
@@ -445,6 +451,26 @@ public static class MetadataResolver
             && AbiEquivalent(c.ReturnType, first.ReturnType, types)
             && c.Parameters.Count == first.Parameters.Count
             && SameAbiParameterTypes(c, first, types));
+    }
+
+    // The lifter attaches the operands it observed, so a candidate that cannot take that many arguments
+    // cannot be the callee. Restrict to the candidates whose arity fits the call and fold when those all
+    // share the same call shape.
+    private static MethodAnalysisContext? FoldByCallArity(List<MethodAnalysisContext> candidates, Instruction call)
+    {
+        // Non-target operands are the arguments (a value-returning call also carries its result local).
+        var slots = call.Operands.Count - (call.OpCode == OpCode.Call ? 2 : 1);
+
+        static int Used(MethodAnalysisContext c) => c.Parameters.Count + (c.IsStatic ? 0 : 1);
+
+        // A shared/generic call can carry a trailing operand that is not a real parameter, so a candidate may
+        // take one argument fewer than the call appears to pass. Try the shorter arity first, then the exact.
+        var shorter = candidates.Where(c => Used(c) == slots - 1).ToList();
+        if (shorter.Count > 0 && ShareCallShape(shorter))
+            return PreferredOf(shorter);
+
+        var exact = candidates.Where(c => Used(c) == slots).ToList();
+        return exact.Count > 0 && ShareCallShape(exact) ? PreferredOf(exact) : null;
     }
 
     private static bool SameAbiParameterTypes(MethodAnalysisContext a, MethodAnalysisContext b, SystemTypesContext types)
