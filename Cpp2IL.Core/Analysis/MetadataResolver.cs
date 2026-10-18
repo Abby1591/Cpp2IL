@@ -507,9 +507,24 @@ public static class MetadataResolver
         if (IsIndirectValueType(a, types) && IsIndirectValueType(b, types))
             return true;
 
+        // Everything that is one machine word wide is ABI-identical to every other such value: reference
+        // types, pointers, byrefs and the native-sized IntPtr/UIntPtr all arrive in a single reference slot.
+        // Value types (whose size depends on their layout) and void are excluded.
+        if (IsPointerSized(a, types) && IsPointerSized(b, types))
+            return true;
+
         var width = IntegerWidth(a, types);
         return width != 0 && width == IntegerWidth(b, types);
     }
+
+    // A pointer, byref, or the native-sized IntPtr/UIntPtr: all occupy one reference slot.
+    private static bool IsPointerSized(TypeAnalysisContext? type, SystemTypesContext types) =>
+        type is not null
+        && !ReferenceEquals(type, types.SystemVoidType)
+        && (ReferenceEquals(type, types.SystemIntPtrType)
+            || ReferenceEquals(type, types.SystemUIntPtrType)
+            || type is PointerTypeAnalysisContext
+            || type is ByRefTypeAnalysisContext);
 
     // A value type that is neither an integer-width primitive nor a by-value primitive (float/double, IntPtr,
     // bool, TypedReference) nor an enum: such a type is passed by reference, so two of them are ABI-identical.

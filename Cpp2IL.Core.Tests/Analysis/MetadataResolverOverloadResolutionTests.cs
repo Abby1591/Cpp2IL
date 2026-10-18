@@ -254,6 +254,32 @@ public class MetadataResolverOverloadResolutionTests
     }
 
     [Test]
+    public void PointerSizedParametersAreFoldable()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_5682;
+
+        // IntPtr, UIntPtr, raw pointers and byrefs all occupy a single reference slot on this target, so a
+        // body shared between methods taking different such types is indistinguishable at the call site.
+        var addHandle = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Add",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemIntPtrType]);
+        var addPointer = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Add",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [new PointerTypeAnalysisContext(appContext.SystemTypes.SystemVoidType)]);
+        appContext.MethodsByAddress[shared] = [addHandle, addPointer];
+
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)));
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)]);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(addHandle), "IntPtr and a raw pointer occupy the same slot");
+    }
+
+    [Test]
     public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
