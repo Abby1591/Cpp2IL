@@ -137,6 +137,32 @@ public class GenericDefinitionCallResolutionTests
         Assert.That(call.Operands[0], Is.InstanceOf<StringLiteral>(), "an already-bound call must be left untouched");
     }
 
+    [Test]
+    public void ResolveAmbiguousCallsFoldsUnrelatedTypesThatShareTheCallShape()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        var types = appContext.SystemTypes;
+
+        // ICF folds e.g. every state machine's empty System.IDisposable.Dispose to one body; the declaring
+        // types differ but the call is indistinguishable, so a same-shaped candidate is as good as any.
+        var first = new InjectedMethodAnalysisContext(
+            types.SystemObjectType, "Dispose", types.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, []);
+        var second = new InjectedMethodAnalysisContext(
+            types.SystemVoidType, "Dispose", types.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, []);
+
+        const ulong address = 0x0000_00A0_1234_5006;
+        appContext.MethodsByAddress[address] = [first, second];
+
+        var call = MakeCall(address);
+        var caller = MakeCaller(appContext, call);
+
+        MetadataResolver.ResolveAmbiguousCalls(caller);
+
+        Assert.That(call.Operands[0], Is.SameAs(first), "an ICF fold of same-shaped methods resolves to one of them");
+    }
+
     private static Instruction MakeCall(ulong address) => new(0, OpCode.CallVoid, new Immediate(unchecked((long)address)));
 
     private static InjectedMethodAnalysisContext MakeCaller(ApplicationAnalysisContext appContext, Instruction call)

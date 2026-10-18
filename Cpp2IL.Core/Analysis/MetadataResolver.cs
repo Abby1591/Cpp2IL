@@ -364,42 +364,45 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (GetReceiver(instruction, preferThis: method.Name == ".ctor") is not { } receiver)
-                continue;
+            // Handle methods with shared bodies
+            var match = default(MethodAnalysisContext);
 
             // The receiver's own type is the best disambiguator, but a `this` receiver which hasn't
             // been typed yet still tells us the declaring type - that is enough to resolve a call
             // through a shared body (e.g. a ctor chaining to a folded base ctor, or a shared empty
             // Dispose) by matching the candidate whose declaring type is on our base chain.
-            var receiverType = receiver.Type ?? (receiver.IsThis ? method.DeclaringType : null);
+            var receiver = GetReceiver(instruction, preferThis: method.Name == ".ctor");
+            var receiverType = receiver?.Type ?? (receiver is { IsThis: true } ? method.DeclaringType : null);
 
-            if (receiverType == null)
-                continue;
-
-            // Prefer picking base ctor if we are a ctor
-            var callerIsCtor = method.Name == ".ctor" && receiver.IsThis;
-
-            // Handle methods with shared bodies
-            var match = default(MethodAnalysisContext);
-
-            for (var type = receiverType; type != null && match == null; type = type.BaseType)
+            if (receiverType != null)
             {
-                var matches = candidates.Where(c => !c.IsStatic && IsSameType(c.DeclaringType, type)).ToList();
+                // Prefer picking base ctor if we are a ctor
+                var callerIsCtor = method.Name == ".ctor" && receiver!.IsThis;
 
-                if (matches.Count > 1 && callerIsCtor)
-                    matches = matches.Where(c => c.Name == ".ctor").ToList();
+                for (var type = receiverType; type != null && match == null; type = type.BaseType)
+                {
+                    var matches = candidates.Where(c => !c.IsStatic && IsSameType(c.DeclaringType, type)).ToList();
 
-                if (matches.Count > 1)
-                    break;
+                    if (matches.Count > 1 && callerIsCtor)
+                        matches = matches.Where(c => c.Name == ".ctor").ToList();
 
-                match = matches.SingleOrDefault();
+                    if (matches.Count > 1)
+                        break;
+
+                    match = matches.SingleOrDefault();
+                }
             }
 
             if (match == null)
                 match = TryMatchStaticByFirstArgument(candidates, instruction);
 
-            if (match == null)
+            if (match == null && receiverType != null)
                 match = TryMatchInstanceByTypedArguments(candidates, instruction, receiverType);
+
+            // Last resort: an ICF fold of unrelated types that share the exact call shape. Only reached when
+            // neither the receiver's type nor any argument could disambiguate, so there is no better answer.
+            if (match == null && ShareCallShape(candidates))
+                match = PreferredOf(candidates);
 
             if (match == null)
                 continue;
@@ -418,6 +421,21 @@ public static class MetadataResolver
 
         return candidates.All(c => c.IsStatic == first.IsStatic
             && ReferenceEquals(c.DeclaringType, first.DeclaringType)
+            && ReferenceEquals(c.ReturnType, first.ReturnType)
+            && c.Parameters.Count == first.Parameters.Count
+            && SameParameterTypes(c, first));
+    }
+
+    // ICF folds genuinely unrelated methods to one body (e.g. every state machine's empty
+    // `System.IDisposable.Dispose`) so the declaring types differ. When neither the receiver's type nor any
+    // argument can pick one out, the call is nevertheless indistinguishable at the call site as long as the
+    // observable call shape - name, signature and return - matches.
+    private static bool ShareCallShape(List<MethodAnalysisContext> candidates)
+    {
+        var first = candidates[0];
+
+        return candidates.All(c => c.IsStatic == first.IsStatic
+            && c.Name == first.Name
             && ReferenceEquals(c.ReturnType, first.ReturnType)
             && c.Parameters.Count == first.Parameters.Count
             && SameParameterTypes(c, first));
