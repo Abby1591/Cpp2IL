@@ -436,18 +436,20 @@ public static class MetadataResolver
     }
 
     // ICF folds genuinely unrelated methods to one body (e.g. every state machine's empty
-    // `System.IDisposable.Dispose`) so the declaring types differ. When neither the receiver's type nor any
-    // argument can pick one out, the call is nevertheless indistinguishable at the call site as long as the
-    // observable call shape - name, argument and return slots - matches. Two methods that share a body behave
-    // identically, and integer primitives of the same width occupy the same argument slots (byte/sbyte,
-    // short/ushort, int/uint, long/ulong), so such bodies are interchangeable at the call.
+    // `System.IDisposable.Dispose`, or `Environment::get_CurrentManagedThreadId` alongside
+    // `TraceEventCache::GetThreadId`), so the declaring types - and often the names - differ. When neither
+    // the receiver's type nor any argument can pick one out, the call is nevertheless indistinguishable at
+    // the call site as long as the observable call shape - the argument and return slots - matches. Two
+    // methods that share a body behave identically, and integer primitives of the same width occupy the
+    // same argument slots (byte/sbyte, short/ushort, int/uint, long/ulong), so such bodies are
+    // interchangeable at the call. The name is deliberately not compared: sharing a body means the call
+    // computes the same thing whichever name is emitted (matching <see cref="AreInterchangeable"/>).
     private static bool ShareCallShape(List<MethodAnalysisContext> candidates)
     {
         var first = candidates[0];
         var types = first.AppContext.SystemTypes;
 
         return candidates.All(c => c.IsStatic == first.IsStatic
-            && c.Name == first.Name
             && AbiEquivalent(c.ReturnType, first.ReturnType, types)
             && c.Parameters.Count == first.Parameters.Count
             && SameAbiParameterTypes(c, first, types));

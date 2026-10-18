@@ -199,6 +199,34 @@ public class MetadataResolverOverloadResolutionTests
     }
 
     [Test]
+    public void IcfFoldedMethodsWithDifferentNamesAreFoldedAtTheCallSite()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_5680;
+
+        // ICF folds unrelated same-shape methods onto one body (e.g. Environment::get_CurrentManagedThreadId
+        // and TraceEventCache::GetThreadId), so the declaring types - and names - differ. Neither the receiver
+        // nor any argument can pick one out and the call carries no operands, so the shared body is the only
+        // thing left to go on: either name is a correct answer.
+        var doByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Do",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemByteType]);
+        var actSByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Act",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemSByteType]);
+        appContext.MethodsByAddress[shared] = [doByte, actSByte];
+
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)));
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)]);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(doByte), "a shared body makes the differing name irrelevant");
+    }
+
+    [Test]
     public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
