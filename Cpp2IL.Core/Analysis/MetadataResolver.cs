@@ -507,14 +507,23 @@ public static class MetadataResolver
         if (IsIndirectValueType(a, types) && IsIndirectValueType(b, types))
             return true;
 
-        // Everything that is one machine word wide is ABI-identical to every other such value: reference
-        // types, pointers, byrefs and the native-sized IntPtr/UIntPtr all arrive in a single reference slot.
-        // Value types (whose size depends on their layout) and void are excluded.
-        if (IsPointerSized(a, types) && IsPointerSized(b, types))
-            return true;
+        // A by-value argument occupies exactly one machine slot, and any two values of the same slot width
+        // are interchangeable at the call site: a pointer, a byref and the native-sized IntPtr/UIntPtr are
+        // each the target's pointer width, so on a 32-bit target they fold with int/uint as well.
+        // References and floats are left exact (width 0) and value types are handled above.
+        var width = SlotWidth(a, types);
+        return width != 0 && width == SlotWidth(b, types);
+    }
 
-        var width = IntegerWidth(a, types);
-        return width != 0 && width == IntegerWidth(b, types);
+    // The width in bytes of the single machine slot a by-value argument occupies, or 0 for anything we do
+    // not treat as slot-interchangeable (references, void, unknown). Integer primitives use their own width;
+    // pointers, byrefs and IntPtr/UIntPtr use the target's pointer width.
+    private static int SlotWidth(TypeAnalysisContext? type, SystemTypesContext types)
+    {
+        if (IsPointerSized(type, types))
+            return (type ?? types.SystemObjectType).AppContext.Binary.PointerSizeBytes;
+
+        return IntegerWidth(type, types);
     }
 
     // A pointer, byref, or the native-sized IntPtr/UIntPtr: all occupy one reference slot.
