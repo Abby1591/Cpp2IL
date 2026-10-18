@@ -112,4 +112,55 @@ public class MetadataResolverOverloadResolutionTests
 
         Assert.That(call.Operands[0], Is.InstanceOf<Immediate>(), "a disagreeing argument must not force a guess");
     }
+
+    [Test]
+    public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_567B;
+
+        // ReadSByte and ReadByte share a body; the receiver and arguments agree, but their return types differ.
+        var readByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Read",
+            appContext.SystemTypes.SystemByteType, MethodAttributes.Public | MethodAttributes.Static, []);
+        var readSByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Read",
+            appContext.SystemTypes.SystemSByteType, MethodAttributes.Public | MethodAttributes.Static, []);
+
+        appContext.MethodsByAddress[shared] = [readByte, readSByte];
+
+        // Only the destination's type tells the two overloads apart.
+        var result = new LocalVariable("result", new Register(null, "eax"), appContext.SystemTypes.SystemSByteType);
+        var call = new Instruction(0, OpCode.Call, new Immediate(unchecked((long)shared)), result);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], result);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(readSByte), "the sbyte overload matches the typed result local");
+    }
+
+    [Test]
+    public void ReturnTypedOverloadsStayUnresolvedWhenTheResultIsUntyped()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_567C;
+
+        var readByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Read",
+            appContext.SystemTypes.SystemByteType, MethodAttributes.Public | MethodAttributes.Static, []);
+        var readSByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Read",
+            appContext.SystemTypes.SystemSByteType, MethodAttributes.Public | MethodAttributes.Static, []);
+
+        appContext.MethodsByAddress[shared] = [readByte, readSByte];
+
+        // An untyped destination leaves both candidates viable, so the call must stay unresolved.
+        var result = new LocalVariable("result", new Register(null, "eax"));
+        var call = new Instruction(0, OpCode.Call, new Immediate(unchecked((long)shared)), result);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], result);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.InstanceOf<Immediate>(), "no unique return match means the call stays unresolved");
+    }
 }

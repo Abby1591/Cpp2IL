@@ -399,6 +399,9 @@ public static class MetadataResolver
             if (match == null && receiverType != null)
                 match = TryMatchInstanceByTypedArguments(candidates, instruction, receiverType);
 
+            if (match == null)
+                match = TryMatchByTypedReturn(candidates, instruction);
+
             // Last resort: an ICF fold of unrelated types that share the exact call shape. Only reached when
             // neither the receiver's type nor any argument could disambiguate, so there is no better answer.
             if (match == null && ShareCallShape(candidates))
@@ -527,6 +530,42 @@ public static class MetadataResolver
 
             if (match != null)
                 return null; // ambiguous - two static candidates take the same first argument
+
+            match = candidate;
+        }
+
+        return match;
+    }
+
+    // Overloads that differ only by return type (e.g. Hazel.MessageReader::ReadSByte vs ReadByte, or
+    // Nullable<X>::get_Value across instantiations) cannot be told apart by the receiver or the arguments,
+    // but the call's result is written to a local that may already be typed. Keep only the candidates that
+    // return that type and commit just when one survives.
+    private static MethodAnalysisContext? TryMatchByTypedReturn(List<MethodAnalysisContext> candidates, Instruction call)
+    {
+        // A value-returning call carries its destination local right after the target.
+        if (call.OpCode != OpCode.Call || call.Operands.Count < 2)
+            return null;
+
+        var returnType = call.Operands[1] switch
+        {
+            LocalVariable { Type: { } localType } => localType,
+            AddressOf { Target: LocalVariable { Type: { } addressedType } } => addressedType,
+            _ => null
+        };
+
+        if (returnType == null)
+            return null;
+
+        MethodAnalysisContext? match = null;
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.ReturnType is not { } candidateReturn || !IsSameType(candidateReturn, returnType))
+                continue;
+
+            if (match != null)
+                return null; // two candidates return the same type - still ambiguous
 
             match = candidate;
         }
