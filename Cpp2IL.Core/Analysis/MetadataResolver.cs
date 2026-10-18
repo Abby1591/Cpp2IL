@@ -523,10 +523,11 @@ public static class MetadataResolver
         && !ReferenceEquals(type, types.SystemBooleanType)
         && !ReferenceEquals(type, types.SystemTypedReferenceType);
 
-    // The width of an integer primitive in bytes, or 0 for anything else. Only these are treated as
+    // The width of an integer-like primitive in bytes, or 0 for anything else. Only these are treated as
     // interchangeable: float/double and references have distinct calling behaviour and are left exact.
+    // bool sits in the same one-byte slot as byte/sbyte.
     private static int IntegerWidth(TypeAnalysisContext? type, SystemTypesContext types) =>
-        ReferenceEquals(type, types.SystemSByteType) || ReferenceEquals(type, types.SystemByteType) ? 1
+        ReferenceEquals(type, types.SystemSByteType) || ReferenceEquals(type, types.SystemByteType) || ReferenceEquals(type, types.SystemBooleanType) ? 1
         : ReferenceEquals(type, types.SystemInt16Type) || ReferenceEquals(type, types.SystemUInt16Type) || ReferenceEquals(type, types.SystemCharType) ? 2
         : ReferenceEquals(type, types.SystemInt32Type) || ReferenceEquals(type, types.SystemUInt32Type) ? 4
         : ReferenceEquals(type, types.SystemInt64Type) || ReferenceEquals(type, types.SystemUInt64Type) ? 8
