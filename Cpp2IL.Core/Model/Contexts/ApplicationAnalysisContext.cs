@@ -203,6 +203,38 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
         }
     }
 
+    /// <summary>
+    /// The methods a call to <paramref name="address"/> can target, with one adjustment: a generic method's
+    /// open definition carries the same native pointer as the instantiated bodies it was compiled into, so a
+    /// definition listed next to the instantiation(s) it produced is not real ambiguity - the open body is
+    /// only reachable through an instantiation. Those definitions are dropped here so the call binds to the
+    /// concrete method (or to the instantiation the receiver's type selects) instead of being left unresolved.
+    /// Falls back to the raw list when narrowing would leave nothing.
+    /// </summary>
+    public List<MethodAnalysisContext>? GetCallCandidatesAt(ulong address)
+    {
+        if (!MethodsByAddress.TryGetValue(address, out var candidates))
+            return null;
+
+        if (candidates.Count < 2)
+            return candidates;
+
+        HashSet<Il2CppMethodDefinition>? instantiated = null;
+
+        foreach (var candidate in candidates)
+            if (candidate is ConcreteGenericMethodAnalysisContext { BaseMethodContext.Definition: { } definition })
+                (instantiated ??= []).Add(definition);
+
+        if (instantiated == null)
+            return candidates;
+
+        var narrowed = candidates
+            .Where(c => c is ConcreteGenericMethodAnalysisContext || c.Definition is not { } definition || !instantiated.Contains(definition))
+            .ToList();
+
+        return narrowed.Count > 0 ? narrowed : candidates;
+    }
+
     // ICalls are implemented as a stub that tail-jumps into the runtime (e.g. Math.Ceiling => the c runtime's
     // ceil, Monitor.Enter => il2cpp::vm::Monitor::TryEnter). Many callers get inlined straight to that runtime
     // address, so we map those out ahead of time so we can resolve them. 

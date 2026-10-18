@@ -327,8 +327,31 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            var candidates = method.AppContext.GetCallCandidatesAt(target.UnsignedValue);
+            if (candidates is not { Count: > 0 })
                 continue;
+
+            // A generic method's open definition shares its native body with the instantiation(s) it was
+            // compiled into, so the definition sitting next to them is not real ambiguity. Once it's dropped a
+            // single survivor is the answer. This runs after ResolveCallsViaMethodInfo every iteration, so a
+            // call whose hidden MethodInfo names an instantiation that isn't in the map has already been bound
+            // and won't reach here - leaving only the calls that really do target this one method.
+            if (candidates.Count == 1)
+            {
+                var only = candidates[0];
+
+                // A generic *method* is a special case: unless the metadata happened to record the caller's
+                // instantiation, the only concrete in the map can be a placeholder (System.Object) that is not
+                // what the caller wants. Only the hidden MethodInfo names the exact one, and that path may need
+                // further passes to become usable, so never pre-empt it by guessing here.
+                if (only is ConcreteGenericMethodAnalysisContext { BaseMethodContext.GenericParameters.Count: > 0 })
+                    continue;
+
+                instruction.SetOperand(0, only);
+                only.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, only, method);
+                changed = true;
+                continue;
+            }
 
             // e.g. string.Equals and string.op_Equality, identical params, instance type, and bodies are shared
             // we can't differentiate which is being called but it doesn't matter
