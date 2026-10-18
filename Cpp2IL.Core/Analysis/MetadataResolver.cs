@@ -500,9 +500,28 @@ public static class MetadataResolver
         if (a is ArrayTypeAnalysisContext arrA && b is ArrayTypeAnalysisContext arrB)
             return arrA.Rank == arrB.Rank && AbiEquivalent(arrA.ElementType, arrB.ElementType, types);
 
+        // Two non-primitive value types are both passed indirectly (by reference) under the il2cpp ABI, so
+        // they occupy the same argument slot(s) however their layouts differ - which is all the call site can
+        // observe. Primitive value types (integers, char, float/double, IntPtr, bool) and enums are passed by
+        // value instead, and are compared by the width rule below.
+        if (IsIndirectValueType(a, types) && IsIndirectValueType(b, types))
+            return true;
+
         var width = IntegerWidth(a, types);
         return width != 0 && width == IntegerWidth(b, types);
     }
+
+    // A value type that is neither an integer-width primitive nor a by-value primitive (float/double, IntPtr,
+    // bool, TypedReference) nor an enum: such a type is passed by reference, so two of them are ABI-identical.
+    private static bool IsIndirectValueType(TypeAnalysisContext? type, SystemTypesContext types) =>
+        type is { IsValueType: true, IsEnumType: false }
+        && IntegerWidth(type, types) == 0
+        && !ReferenceEquals(type, types.SystemSingleType)
+        && !ReferenceEquals(type, types.SystemDoubleType)
+        && !ReferenceEquals(type, types.SystemIntPtrType)
+        && !ReferenceEquals(type, types.SystemUIntPtrType)
+        && !ReferenceEquals(type, types.SystemBooleanType)
+        && !ReferenceEquals(type, types.SystemTypedReferenceType);
 
     // The width of an integer primitive in bytes, or 0 for anything else. Only these are treated as
     // interchangeable: float/double and references have distinct calling behaviour and are left exact.
