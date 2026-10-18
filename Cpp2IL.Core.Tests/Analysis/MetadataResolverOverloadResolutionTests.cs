@@ -114,6 +114,60 @@ public class MetadataResolverOverloadResolutionTests
     }
 
     [Test]
+    public void SameWidthIntegerOverloadsAreFoldedWhenNoArgumentTypeIsKnown()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_567D;
+
+        // byte and sbyte occupy the same argument slot and share the body, so the call is unambiguous
+        // even though the argument's type is unknown.
+        var writeByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Write",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemByteType]);
+        var writeSByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Write",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemSByteType]);
+        appContext.MethodsByAddress[shared] = [writeByte, writeSByte];
+
+        var receiver = new LocalVariable("writer", new Register(null, "esi"), appContext.SystemTypes.SystemObjectType);
+        var argument = new LocalVariable("value", new Register(null, "edi"));
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)), receiver, argument);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], receiver, argument);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(writeByte), "same-width integer overloads are interchangeable at the call site");
+    }
+
+    [Test]
+    public void DifferentWidthIntegerOverloadsStayUnresolved()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_567E;
+
+        var writeByte = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Write",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemByteType]);
+        var writeInt = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Write",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemInt32Type]);
+        appContext.MethodsByAddress[shared] = [writeByte, writeInt];
+
+        var receiver = new LocalVariable("writer", new Register(null, "esi"), appContext.SystemTypes.SystemObjectType);
+        var argument = new LocalVariable("value", new Register(null, "edi"));
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)), receiver, argument);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], receiver, argument);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.InstanceOf<Immediate>(), "different-width overloads are not interchangeable");
+    }
+
+    [Test]
     public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;
@@ -148,11 +202,11 @@ public class MetadataResolverOverloadResolutionTests
         var readByte = new InjectedMethodAnalysisContext(
             appContext.SystemTypes.SystemObjectType, "Read",
             appContext.SystemTypes.SystemByteType, MethodAttributes.Public | MethodAttributes.Static, []);
-        var readSByte = new InjectedMethodAnalysisContext(
+        var readInt = new InjectedMethodAnalysisContext(
             appContext.SystemTypes.SystemVoidType, "Read",
-            appContext.SystemTypes.SystemSByteType, MethodAttributes.Public | MethodAttributes.Static, []);
+            appContext.SystemTypes.SystemInt32Type, MethodAttributes.Public | MethodAttributes.Static, []);
 
-        appContext.MethodsByAddress[shared] = [readByte, readSByte];
+        appContext.MethodsByAddress[shared] = [readByte, readInt];
 
         // An untyped destination leaves both candidates viable, so the call must stay unresolved.
         var result = new LocalVariable("result", new Register(null, "eax"));

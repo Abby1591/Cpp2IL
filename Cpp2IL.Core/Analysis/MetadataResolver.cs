@@ -432,17 +432,49 @@ public static class MetadataResolver
     // ICF folds genuinely unrelated methods to one body (e.g. every state machine's empty
     // `System.IDisposable.Dispose`) so the declaring types differ. When neither the receiver's type nor any
     // argument can pick one out, the call is nevertheless indistinguishable at the call site as long as the
-    // observable call shape - name, signature and return - matches.
+    // observable call shape - name, argument and return slots - matches. Two methods that share a body behave
+    // identically, and integer primitives of the same width occupy the same argument slots (byte/sbyte,
+    // short/ushort, int/uint, long/ulong), so such bodies are interchangeable at the call.
     private static bool ShareCallShape(List<MethodAnalysisContext> candidates)
     {
         var first = candidates[0];
+        var types = first.AppContext.SystemTypes;
 
         return candidates.All(c => c.IsStatic == first.IsStatic
             && c.Name == first.Name
-            && ReferenceEquals(c.ReturnType, first.ReturnType)
+            && AbiEquivalent(c.ReturnType, first.ReturnType, types)
             && c.Parameters.Count == first.Parameters.Count
-            && SameParameterTypes(c, first));
+            && SameAbiParameterTypes(c, first, types));
     }
+
+    private static bool SameAbiParameterTypes(MethodAnalysisContext a, MethodAnalysisContext b, SystemTypesContext types)
+    {
+        for (var i = 0; i < a.Parameters.Count; i++)
+        {
+            if (!AbiEquivalent(a.Parameters[i].ParameterType, b.Parameters[i].ParameterType, types))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool AbiEquivalent(TypeAnalysisContext? a, TypeAnalysisContext? b, SystemTypesContext types)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+
+        var width = IntegerWidth(a, types);
+        return width != 0 && width == IntegerWidth(b, types);
+    }
+
+    // The width of an integer primitive in bytes, or 0 for anything else. Only these are treated as
+    // interchangeable: float/double and references have distinct calling behaviour and are left exact.
+    private static int IntegerWidth(TypeAnalysisContext? type, SystemTypesContext types) =>
+        ReferenceEquals(type, types.SystemSByteType) || ReferenceEquals(type, types.SystemByteType) ? 1
+        : ReferenceEquals(type, types.SystemInt16Type) || ReferenceEquals(type, types.SystemUInt16Type) || ReferenceEquals(type, types.SystemCharType) ? 2
+        : ReferenceEquals(type, types.SystemInt32Type) || ReferenceEquals(type, types.SystemUInt32Type) ? 4
+        : ReferenceEquals(type, types.SystemInt64Type) || ReferenceEquals(type, types.SystemUInt64Type) ? 8
+        : 0;
 
     private static bool SameParameterTypes(MethodAnalysisContext a, MethodAnalysisContext b)
     {
