@@ -310,6 +310,67 @@ public class MetadataResolverOverloadResolutionTests
     }
 
     [Test]
+    public void ReferenceTypedParameterOverloadsAreFoldableWhenTheWholeSetSharesTheShape()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_5684;
+
+        // Two static methods taking different reference types share one body: a reference is a single pointer,
+        // so the call site cannot tell them apart and whichever name is emitted computes the same thing.
+        var withString = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Consume",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemStringType]);
+        var withObject = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Consume",
+            appContext.SystemTypes.SystemVoidType, MethodAttributes.Public | MethodAttributes.Static,
+            [appContext.SystemTypes.SystemObjectType]);
+        appContext.MethodsByAddress[shared] = [withString, withObject];
+
+        var argument = new LocalVariable("value", new Register(null, "edx"));
+        var call = new Instruction(0, OpCode.CallVoid, new Immediate(unchecked((long)shared)), argument);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], argument);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.SameAs(withString), "references are interchangeable at the call site");
+    }
+
+    [Test]
+    public void ArityGuessDoesNotFoldReferenceOverloads()
+    {
+        var appContext = Cpp2IlApi.CurrentAppContext!;
+        const ulong shared = 0x0000_00A0_1234_5685;
+
+        // A parameterless getter and two one-parameter reference methods share a body. The lifter attached
+        // extra operands, so the arity guess's "shorter" group is the one-parameter methods; they must not be
+        // treated as interchangeable, or the call binds a shape the operands never fit.
+        var getCurrent = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "get_Current",
+            appContext.SystemTypes.SystemObjectType, MethodAttributes.Public, []);
+        var withString = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemObjectType, "Consume",
+            appContext.SystemTypes.SystemObjectType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemStringType]);
+        var withObject = new InjectedMethodAnalysisContext(
+            appContext.SystemTypes.SystemVoidType, "Consume",
+            appContext.SystemTypes.SystemObjectType, MethodAttributes.Public,
+            [appContext.SystemTypes.SystemObjectType]);
+        appContext.MethodsByAddress[shared] = [getCurrent, withString, withObject];
+
+        var receiver = new LocalVariable("self", new Register(null, "esi"));
+        var result = new LocalVariable("result", new Register(null, "eax"));
+        var extra1 = new LocalVariable("extra1", new Register(null, "edi"));
+        var extra2 = new LocalVariable("extra2", new Register(null, "ebx"));
+        var call = new Instruction(0, OpCode.Call, new Immediate(unchecked((long)shared)), result, receiver, extra1, extra2);
+        var method = MakeCaller([call, new Instruction(1, OpCode.Return)], receiver, result, extra1, extra2);
+
+        MetadataResolver.ResolveAmbiguousCalls(method);
+
+        Assert.That(call.Operands[0], Is.InstanceOf<Immediate>(), "the arity guess must not fold by reference equivalence");
+    }
+
+    [Test]
     public void ReturnTypedOverloadsAreDisambiguatedByTheResultLocal()
     {
         var appContext = Cpp2IlApi.CurrentAppContext!;

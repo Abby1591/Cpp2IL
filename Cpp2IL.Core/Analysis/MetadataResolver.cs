@@ -444,20 +444,23 @@ public static class MetadataResolver
     // same argument slots (byte/sbyte, short/ushort, int/uint, long/ulong), so such bodies are
     // interchangeable at the call. The name is deliberately not compared: sharing a body means the call
     // computes the same thing whichever name is emitted (matching <see cref="AreInterchangeable"/>).
-    private static bool ShareCallShape(List<MethodAnalysisContext> candidates)
+    private static bool ShareCallShape(List<MethodAnalysisContext> candidates, bool relaxReferences = true)
     {
         var first = candidates[0];
         var types = first.AppContext.SystemTypes;
 
         return candidates.All(c => c.IsStatic == first.IsStatic
-            && AbiEquivalent(c.ReturnType, first.ReturnType, types)
+            && AbiEquivalent(c.ReturnType, first.ReturnType, types, relaxReferences)
             && c.Parameters.Count == first.Parameters.Count
-            && SameAbiParameterTypes(c, first, types));
+            && SameAbiParameterTypes(c, first, types, relaxReferences));
     }
 
     // The lifter attaches the operands it observed, so a candidate that cannot take that many arguments
     // cannot be the callee. Restrict to the candidates whose arity fits the call and fold when those all
     // share the same call shape.
+    // The arity guess is already a heuristic about how many operands the call really passes, so it does not
+    // also relax the type classes: two references are only interchangeable when the whole candidate set is
+    // being folded (see ShareCallShape's relaxReferences), not when picking a subset by arity.
     private static MethodAnalysisContext? FoldByCallArity(List<MethodAnalysisContext> candidates, Instruction call)
     {
         // Non-target operands are the arguments (a value-returning call also carries its result local).
@@ -468,25 +471,25 @@ public static class MetadataResolver
         // A shared/generic call can carry a trailing operand that is not a real parameter, so a candidate may
         // take one argument fewer than the call appears to pass. Try the shorter arity first, then the exact.
         var shorter = candidates.Where(c => Used(c) == slots - 1).ToList();
-        if (shorter.Count > 0 && ShareCallShape(shorter))
+        if (shorter.Count > 0 && ShareCallShape(shorter, relaxReferences: false))
             return PreferredOf(shorter);
 
         var exact = candidates.Where(c => Used(c) == slots).ToList();
-        return exact.Count > 0 && ShareCallShape(exact) ? PreferredOf(exact) : null;
+        return exact.Count > 0 && ShareCallShape(exact, relaxReferences: false) ? PreferredOf(exact) : null;
     }
 
-    private static bool SameAbiParameterTypes(MethodAnalysisContext a, MethodAnalysisContext b, SystemTypesContext types)
+    private static bool SameAbiParameterTypes(MethodAnalysisContext a, MethodAnalysisContext b, SystemTypesContext types, bool relaxReferences = true)
     {
         for (var i = 0; i < a.Parameters.Count; i++)
         {
-            if (!AbiEquivalent(a.Parameters[i].ParameterType, b.Parameters[i].ParameterType, types))
+            if (!AbiEquivalent(a.Parameters[i].ParameterType, b.Parameters[i].ParameterType, types, relaxReferences))
                 return false;
         }
 
         return true;
     }
 
-    private static bool AbiEquivalent(TypeAnalysisContext? a, TypeAnalysisContext? b, SystemTypesContext types)
+    private static bool AbiEquivalent(TypeAnalysisContext? a, TypeAnalysisContext? b, SystemTypesContext types, bool relaxReferences = true)
     {
         if (ReferenceEquals(a, b))
             return true;
@@ -495,10 +498,10 @@ public static class MetadataResolver
         // types are resolved per-parameter, so two `byte[]`s are different instances that a reference check
         // would reject; compare arrays structurally instead, matching the width rule for primitives below.
         if (a is SzArrayTypeAnalysisContext szA && b is SzArrayTypeAnalysisContext szB)
-            return AbiEquivalent(szA.ElementType, szB.ElementType, types);
+            return AbiEquivalent(szA.ElementType, szB.ElementType, types, relaxReferences);
 
         if (a is ArrayTypeAnalysisContext arrA && b is ArrayTypeAnalysisContext arrB)
-            return arrA.Rank == arrB.Rank && AbiEquivalent(arrA.ElementType, arrB.ElementType, types);
+            return arrA.Rank == arrB.Rank && AbiEquivalent(arrA.ElementType, arrB.ElementType, types, relaxReferences);
 
         // Two non-primitive value types are both passed indirectly (by reference) under the il2cpp ABI, so
         // they occupy the same argument slot(s) however their layouts differ - which is all the call site can
@@ -506,6 +509,12 @@ public static class MetadataResolver
         // value instead, and are compared by the width rule below.
         if (IsIndirectValueType(a, types) && IsIndirectValueType(b, types))
             return true;
+
+        // Two reference types are each a single pointer, so they occupy the same argument slot however
+        // different the types are - the call site cannot tell them apart. Pointers, byrefs and void are not
+        // references (they are handled by the slot-width rule below), and value types are handled above.
+        if (IsReference(a, types) && IsReference(b, types))
+            return relaxReferences;
 
         // A by-value argument occupies exactly one machine slot, and any two values of the same slot width
         // are interchangeable at the call site: a pointer, a byref and the native-sized IntPtr/UIntPtr are
@@ -525,6 +534,13 @@ public static class MetadataResolver
 
         return IntegerWidth(type, types);
     }
+
+    // A managed reference type (class, interface, array): a single pointer slot, whatever the type.
+    private static bool IsReference(TypeAnalysisContext? type, SystemTypesContext types) =>
+        type is { IsValueType: false }
+        && !ReferenceEquals(type, types.SystemVoidType)
+        && type is not PointerTypeAnalysisContext
+        && type is not ByRefTypeAnalysisContext;
 
     // A pointer, byref, or the native-sized IntPtr/UIntPtr: all occupy one reference slot.
     private static bool IsPointerSized(TypeAnalysisContext? type, SystemTypesContext types) =>
